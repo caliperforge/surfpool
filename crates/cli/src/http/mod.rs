@@ -22,8 +22,11 @@ use juniper_graphql_ws::ConnectionConfig;
 use log::{debug, error, info, trace, warn};
 #[cfg(feature = "explorer")]
 use rust_embed::RustEmbed;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp_actix_web::transport::StreamableHttpService;
 use serde::{Deserialize, Serialize};
 use surfpool_core::scenarios::TemplateRegistry;
+use surfpool_mcp::Surfpool;
 use surfpool_studio_ui::serve_studio_static_files;
 use surfpool_types::{
     DataIndexingCommand, OverrideTemplate, SanitizedConfig, Scenario, SubgraphEvent, SurfpoolConfig,
@@ -51,6 +54,14 @@ pub async fn start_studio_and_scenario_server(
     let template_registry_wrapped = Data::new(RwLock::new(TemplateRegistry::new()));
     let loaded_scenarios = Data::new(RwLock::new(LoadedScenarios::new()));
 
+    // Initialize MCP service
+    let mcp_service = StreamableHttpService::builder()
+        .service_factory(Arc::new(|| Ok(Surfpool::new())))
+        .session_manager(Arc::new(LocalSessionManager::default()))
+        .stateful_mode(true)
+        .sse_keep_alive(Duration::from_secs(30))
+        .build();
+
     let server = HttpServer::new(move || {
         let mut app = App::new()
             .app_data(config_wrapped.clone())
@@ -61,6 +72,7 @@ pub async fn start_studio_and_scenario_server(
                     .allow_any_origin()
                     .allow_any_method()
                     .allow_any_header()
+                    .expose_headers(vec!["Mcp-Session-Id", "mcp-session-id"])
                     .supports_credentials()
                     .max_age(3600),
             )
@@ -71,7 +83,8 @@ pub async fn start_studio_and_scenario_server(
             .service(post_scenarios)
             .service(get_scenarios)
             .service(delete_scenario)
-            .service(patch_scenario);
+            .service(patch_scenario)
+            .service(web::scope("/mcp").service(mcp_service.clone().scope()));
 
         if enable_studio {
             app = app.app_data(Arc::new(RwLock::new(LoadedScenarios::new())));

@@ -975,6 +975,7 @@ pub enum DataIndexingCommand {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct JitoBundleStatus {
     pub bundle_id: String,
     pub transactions: Vec<String>,

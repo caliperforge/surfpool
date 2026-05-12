@@ -105,7 +105,7 @@ pub enum StorageError {
     #[error("Sqlite storage is not enabled in this build")]
     SqliteNotEnabled,
     #[error(
-        "Postgres storage is not enabled in this build. To use PostgreSQL, build surfpool from source with the `postgres` feature flag:\n  git clone https://github.com/solana-foundation/surfpool.git && cd surfpool\n  cargo surfpool-install --features postgres\nPre-built binaries and the official Docker image do not include PostgreSQL support."
+        "Postgres storage is not enabled in this build. To use PostgreSQL, build surfpool from source with the `postgres` feature flag."
     )]
     PostgresNotEnabled,
     #[error("Invalid Postgres database URL: {0}")]

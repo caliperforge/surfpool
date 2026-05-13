@@ -580,7 +580,10 @@ mod tests {
             .rpc
             .get_bundle_statuses(Some(setup.context), too_many)
             .await;
-        assert!(result.is_err(), "exceeding MAX_BUNDLES_PER_QUERY should error");
+        assert!(
+            result.is_err(),
+            "exceeding MAX_BUNDLES_PER_QUERY should error"
+        );
         let err = result.unwrap_err();
         assert!(
             err.message.contains("exceeds maximum"),

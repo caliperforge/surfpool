@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use solana_client::{rpc_config::RpcSendTransactionConfig, rpc_custom_error::RpcCustomError};
 use solana_rpc_client_api::response::Response as RpcResponse;
 use solana_signature::Signature;
-use solana_transaction::{TransactionError, versioned::VersionedTransaction};
+use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_status::{TransactionConfirmationStatus, UiTransactionEncoding};
 use surfpool_types::{JitoBundleStatus, TransactionStatusEvent};
 
@@ -386,24 +386,21 @@ impl Jito for SurfpoolJitoRpc {
 
             // Bundle txs are processed sequentially in one go; they share the same landing slot and
             // confirmation level, so we take slot/status from the first status entry only.
-            let mut slot = 0u64;
-            let mut confirmation_status: Option<TransactionConfirmationStatus> = None;
-            let mut first_err: Option<TransactionError> = None;
-            let mut took_bundle_fields = false;
+            let (slot, confirmation_status, first_err) = {
+                let mut iter = statuses.value.iter().flatten();
 
-            for status in statuses.value.iter().flatten() {
-                if !took_bundle_fields {
-                    slot = status.slot;
-                    confirmation_status = status.confirmation_status.clone();
-                    took_bundle_fields = true;
-                }
+                let (slot, confirmation_status, head_err) = match iter.next() {
+                    Some(first) => (
+                        first.slot,
+                        first.confirmation_status.clone(),
+                        first.err.clone(),
+                    ),
+                    None => (0, None, None),
+                };
 
-                if first_err.is_none()
-                    && let Some(err) = status.err.clone()
-                {
-                    first_err = Some(err);
-                }
-            }
+                let first_err = head_err.or_else(|| iter.find_map(|s| s.err.clone()));
+                (slot, confirmation_status, first_err)
+            };
 
             let confirmation_status =
                 confirmation_status.unwrap_or(TransactionConfirmationStatus::Processed);
@@ -1074,7 +1071,10 @@ mod tests {
             bundle.transactions, expected_sigs,
             "transactions must preserve submission order across all txs in the bundle"
         );
-        assert!(bundle.err.is_ok(), "successful multi-tx bundle should report Ok");
+        assert!(
+            bundle.err.is_ok(),
+            "successful multi-tx bundle should report Ok"
+        );
         assert!(
             matches!(
                 bundle.confirmation_status,
@@ -1101,7 +1101,10 @@ mod tests {
         let json = serde_json::to_value(&ok_status).expect("JitoBundleStatus should serialize");
 
         // Field names must be camelCase per the documented JSON-RPC contract.
-        assert!(json.get("bundleId").is_some(), "expected camelCase `bundleId` field, got: {json}");
+        assert!(
+            json.get("bundleId").is_some(),
+            "expected camelCase `bundleId` field, got: {json}"
+        );
         assert!(json.get("transactions").is_some());
         assert!(json.get("slot").is_some());
         assert!(
@@ -1111,7 +1114,10 @@ mod tests {
         assert!(json.get("err").is_some());
 
         // Snake-case variants must NOT leak through.
-        assert!(json.get("bundle_id").is_none(), "snake_case `bundle_id` should not be serialized");
+        assert!(
+            json.get("bundle_id").is_none(),
+            "snake_case `bundle_id` should not be serialized"
+        );
         assert!(
             json.get("confirmation_status").is_none(),
             "snake_case `confirmation_status` should not be serialized"

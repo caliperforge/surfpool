@@ -4,7 +4,7 @@ use jsonrpc_core::{BoxFuture, Error, Result};
 use jsonrpc_derive::rpc;
 use sha2::{Digest, Sha256};
 use solana_client::{rpc_config::RpcSendTransactionConfig, rpc_custom_error::RpcCustomError};
-use solana_rpc_client_api::response::Response as RpcResponse;
+use solana_rpc_client_api::response::{Response as RpcResponse, RpcResponseContext};
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_status::{TransactionConfirmationStatus, UiTransactionEncoding};
@@ -18,6 +18,10 @@ use crate::{
 
 /// Maximum number of transactions allowed in a single bundle, matching Jito's limit.
 const MAX_BUNDLE_SIZE: usize = 5;
+
+/// Maximum number of bundle IDs accepted in a single `getBundleStatuses` request, matching
+/// Jito's documented limit. Larger batches are rejected with `invalid_params`.
+const MAX_BUNDLES_PER_QUERY: usize = 5;
 
 /// Jito-specific RPC methods for bundle submission
 #[rpc]
@@ -76,28 +80,30 @@ pub trait Jito {
         config: Option<RpcSendTransactionConfig>,
     ) -> BoxFuture<Result<String>>;
 
-    /// Retrieves a Jito-shaped status summary for a previously submitted bundle.
+    /// Retrieves Jito-shaped status summaries for one or more previously submitted bundles.
     ///
-    /// Looks up the bundle by `bundle_id` (the hex string returned by
-    /// [`sendBundle`](#method.send_bundle)), resolves per-signature status via the same path as
-    /// `getSignatureStatuses`, and returns a single aggregate status object (not one entry per signature).
+    /// Mirrors Jito's wire protocol: the first positional parameter is an **array** of bundle IDs
+    /// (max [`MAX_BUNDLES_PER_QUERY`]). For each requested id we resolve per-signature status via
+    /// the same path as `getSignatureStatuses` and return a single aggregate status object per
+    /// bundle, or `null` at that index when the bundle is unknown locally.
     ///
     /// ## Parameters
-    /// - `bundle_id`: The bundle identifier returned by `sendBundle`.
+    /// - `bundle_ids`: Array of bundle identifiers returned by `sendBundle`. May contain up to
+    ///   [`MAX_BUNDLES_PER_QUERY`] entries; the empty array is rejected with `invalid_params`.
     ///
     /// ## Returns
-    /// On success, the JSON-RPC `result` is either:
-    /// - **`null`**: No bundle is known for this `bundle_id` locally (no stored signatures — the id may be
-    ///   valid elsewhere, we simply have nothing to report).
-    /// - **An object** matching Solana’s contextualized RPC shape:
+    /// On success, the JSON-RPC `result` is the standard Solana contextualized response shape:
     /// - `context.slot`: Context slot from the underlying status query (same idea as `getSignatureStatuses`).
-    /// - `value`: An array with **one** element of type `surfpool_types::JitoBundleStatus`, with:
-    ///   - `bundle_id`: The requested bundle id.
-    ///   - `transactions`: Base-58 signatures in bundle submission order (from local `jito_bundles` storage).
-    ///   - `slot`: Slot from the first per-signature status entry (bundle txs share a landing slot), or `0` if none yet.
-    ///   - `confirmation_status`: From that same first entry (defaults to `processed` when absent).
-    ///   - `err`: `Ok` if no transaction error was observed on any status; otherwise the first `Err` encountered
-    ///     (JSON-serialized like other Solana `Result` values, e.g. `{"Ok": null}` or `{"Err": ...}`).
+    /// - `value`: An array with exactly **one element per input bundle id**, at the same index:
+    ///   - `null` when the bundle id is not known locally (no stored signatures — the id may be
+    ///     valid elsewhere, we simply have nothing to report).
+    ///   - A `surfpool_types::JitoBundleStatus` object otherwise, with:
+    ///     - `bundle_id`: The requested bundle id (snake_case wire field).
+    ///     - `transactions`: Base-58 signatures in bundle submission order (from local `jito_bundles` storage).
+    ///     - `slot`: Slot from the first per-signature status entry (bundle txs share a landing slot), or `0` if none yet.
+    ///     - `confirmation_status`: From that same first entry (defaults to `processed` when absent).
+    ///     - `err`: `Ok` if no transaction error was observed on any status; otherwise the first `Err` encountered
+    ///       (JSON-serialized like other Solana `Result` values, e.g. `{"Ok": null}` or `{"Err": ...}`).
     ///
     /// ## Example Request (JSON-RPC)
     /// ```json
@@ -106,7 +112,7 @@ pub trait Jito {
     ///   "id": 1,
     ///   "method": "getBundleStatuses",
     ///   "params": [
-    ///     "bundleIdHere"
+    ///     ["bundleIdHere", "anotherBundleId"]
     ///   ]
     /// }
     /// ```
@@ -128,31 +134,24 @@ pub trait Jito {
     ///         "slot": 242804011,
     ///         "confirmation_status": "finalized",
     ///         "err": { "Ok": null }
-    ///       }
+    ///       },
+    ///       null
     ///     ]
     ///   }
     /// }
     /// ```
     ///
-    /// When the bundle is not known locally, `result` is JSON `null`:
-    /// ```json
-    /// {
-    ///   "jsonrpc": "2.0",
-    ///   "id": 1,
-    ///   "result": null
-    /// }
-    /// ```
-    ///
     /// ## Notes
     /// - Bundles are stored locally as a mapping from `bundle_id` to a list of base-58 signatures.
-    /// - If the bundle ID is not known locally, **`result` is `null`**, not a JSON-RPC error (Jito-style).
+    /// - Unknown bundle ids appear as `null` **inside** the `value` array; the outer `result` is
+    ///   never `null` (Jito-style: per-index reporting).
     /// - Per-signature status resolution uses the same logic as `getSignatureStatuses` (local store and optional remote datasource).
     #[rpc(meta, name = "getBundleStatuses")]
     fn get_bundle_statuses(
         &self,
         meta: Self::Metadata,
-        bundle_id: String,
-    ) -> BoxFuture<Result<Option<RpcResponse<Vec<JitoBundleStatus>>>>>;
+        bundle_ids: Vec<String>,
+    ) -> BoxFuture<Result<RpcResponse<Vec<Option<JitoBundleStatus>>>>>;
 }
 
 #[derive(Clone)]
@@ -359,9 +358,18 @@ impl Jito for SurfpoolJitoRpc {
     fn get_bundle_statuses(
         &self,
         meta: Self::Metadata,
-        bundle_id: String,
-    ) -> BoxFuture<Result<Option<RpcResponse<Vec<JitoBundleStatus>>>>> {
+        bundle_ids: Vec<String>,
+    ) -> BoxFuture<Result<RpcResponse<Vec<Option<JitoBundleStatus>>>>> {
         Box::pin(async move {
+            if bundle_ids.is_empty() {
+                return Err(Error::invalid_params("bundle_ids cannot be empty"));
+            }
+            if bundle_ids.len() > MAX_BUNDLES_PER_QUERY {
+                return Err(Error::invalid_params(format!(
+                    "bundle_ids exceeds maximum of {MAX_BUNDLES_PER_QUERY} per request"
+                )));
+            }
+
             let Some(ctx) = &meta else {
                 return Err(RpcCustomError::NodeUnhealthy {
                     num_slots_behind: None,
@@ -369,57 +377,75 @@ impl Jito for SurfpoolJitoRpc {
                 .into());
             };
 
-            let Some(signatures) = ctx.svm_locker.get_bundle(&bundle_id) else {
-                return Ok(None);
-            };
-            if signatures.is_empty() {
-                return Ok(None);
-            }
+            // We need a single `context.slot` for the outer RpcResponse. The most accurate slot
+            // is the one returned by the underlying `get_signature_statuses` call; if all
+            // requested bundles are unknown locally we fall back to the locker's latest slot so
+            // the response shape still matches Solana's contextualized RPC contract.
+            let mut last_context: Option<RpcResponseContext> = None;
+            let mut value: Vec<Option<JitoBundleStatus>> = Vec::with_capacity(bundle_ids.len());
 
-            let statuses = super::full::Full::get_signature_statuses(
-                &SurfpoolFullRpc,
-                meta.clone(),
-                signatures.clone(),
-                None,
-            )
-            .await?;
+            for bundle_id in bundle_ids {
+                let Some(signatures) = ctx.svm_locker.get_bundle(&bundle_id) else {
+                    value.push(None);
+                    continue;
+                };
+                if signatures.is_empty() {
+                    value.push(None);
+                    continue;
+                }
 
-            // Bundle txs are processed sequentially in one go; they share the same landing slot and
-            // confirmation level, so we take slot/status from the first status entry only.
-            let (slot, confirmation_status, first_err) = {
-                let mut iter = statuses.value.iter().flatten();
+                let statuses = super::full::Full::get_signature_statuses(
+                    &SurfpoolFullRpc,
+                    meta.clone(),
+                    signatures.clone(),
+                    None,
+                )
+                .await?;
 
-                let (slot, confirmation_status, head_err) = match iter.next() {
-                    Some(first) => (
-                        first.slot,
-                        first.confirmation_status.clone(),
-                        first.err.clone(),
-                    ),
-                    None => (0, None, None),
+                last_context = Some(statuses.context.clone());
+
+                // Bundle txs are processed sequentially in one go; they share the same landing
+                // slot and confirmation level, so we take slot/status from the first status
+                // entry only and aggregate `err` across all entries.
+                let (slot, confirmation_status, first_err) = {
+                    let mut iter = statuses.value.iter().flatten();
+
+                    let (slot, confirmation_status, head_err) = match iter.next() {
+                        Some(first) => (
+                            first.slot,
+                            first.confirmation_status.clone(),
+                            first.err.clone(),
+                        ),
+                        None => (0, None, None),
+                    };
+
+                    let first_err = head_err.or_else(|| iter.find_map(|s| s.err.clone()));
+                    (slot, confirmation_status, first_err)
                 };
 
-                let first_err = head_err.or_else(|| iter.find_map(|s| s.err.clone()));
-                (slot, confirmation_status, first_err)
-            };
+                let confirmation_status =
+                    confirmation_status.unwrap_or(TransactionConfirmationStatus::Processed);
 
-            let confirmation_status =
-                confirmation_status.unwrap_or(TransactionConfirmationStatus::Processed);
+                value.push(Some(JitoBundleStatus {
+                    bundle_id,
+                    transactions: signatures,
+                    slot,
+                    confirmation_status,
+                    err: match first_err {
+                        Some(e) => Err(e),
+                        None => Ok(()),
+                    },
+                }));
+            }
 
-            let bundle_status = JitoBundleStatus {
-                bundle_id,
-                transactions: signatures,
-                slot,
-                confirmation_status,
-                err: match first_err {
-                    Some(e) => Err(e),
-                    None => Ok(()),
-                },
-            };
+            let context = last_context.unwrap_or_else(|| {
+                let slot = ctx
+                    .svm_locker
+                    .with_svm_reader(|svm| svm.get_latest_absolute_slot());
+                RpcResponseContext::new(slot)
+            });
 
-            Ok(Some(RpcResponse {
-                context: statuses.context,
-                value: vec![bundle_status],
-            }))
+            Ok(RpcResponse { context, value })
         })
     }
 }
@@ -511,24 +537,65 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_get_bundle_statuses_unknown_bundle_returns_null() {
+    async fn test_get_bundle_statuses_unknown_bundle_returns_null_entry() {
         let setup = TestSetup::new(SurfpoolJitoRpc);
         let missing_id = "a".repeat(64);
-        let out = setup
+        let response = setup
             .rpc
-            .get_bundle_statuses(Some(setup.context), missing_id)
+            .get_bundle_statuses(Some(setup.context), vec![missing_id])
             .await
             .expect("getBundleStatuses should not return a JSON-RPC error");
+        assert_eq!(
+            response.value.len(),
+            1,
+            "value array must have one entry per requested bundle id"
+        );
         assert!(
-            out.is_none(),
-            "unknown bundle_id should serialize as null result (Ok(None))"
+            response.value[0].is_none(),
+            "unknown bundle_id should appear as a null entry inside `value`, not as an outer null"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_bundle_statuses_empty_input_rejected() {
+        let setup = TestSetup::new(SurfpoolJitoRpc);
+        let result = setup
+            .rpc
+            .get_bundle_statuses(Some(setup.context), vec![])
+            .await;
+        assert!(result.is_err(), "empty bundle_ids should be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("cannot be empty"),
+            "Expected empty-input error, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_bundle_statuses_exceeds_max_per_query_rejected() {
+        let setup = TestSetup::new(SurfpoolJitoRpc);
+        let too_many = vec!["a".repeat(64); MAX_BUNDLES_PER_QUERY + 1];
+        let result = setup
+            .rpc
+            .get_bundle_statuses(Some(setup.context), too_many)
+            .await;
+        assert!(result.is_err(), "exceeding MAX_BUNDLES_PER_QUERY should error");
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("exceeds maximum"),
+            "Expected max-batch error, got: {}",
+            err.message
         );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_bundle_statuses_no_context_returns_unhealthy() {
         let setup = TestSetup::new(SurfpoolJitoRpc);
-        let result = setup.rpc.get_bundle_statuses(None, "a".repeat(64)).await;
+        let result = setup
+            .rpc
+            .get_bundle_statuses(None, vec!["a".repeat(64)])
+            .await;
         assert!(result.is_err());
     }
 
@@ -947,19 +1014,23 @@ mod tests {
         let (bundle, context_slot) = loop {
             let response = setup
                 .rpc
-                .get_bundle_statuses(Some(setup.context.clone()), bundle_id.clone())
+                .get_bundle_statuses(Some(setup.context.clone()), vec![bundle_id.clone()])
                 .await
-                .expect("getBundleStatuses should succeed")
-                .expect("bundle should exist locally after sendBundle");
+                .expect("getBundleStatuses should succeed");
 
             assert_eq!(
                 response.value.len(),
                 1,
-                "getBundleStatuses should return a single bundle status"
+                "getBundleStatuses should return a single status entry per requested id"
             );
 
             let context_slot = response.context.slot;
-            let bundle = response.value.into_iter().next().unwrap();
+            let bundle = response
+                .value
+                .into_iter()
+                .next()
+                .unwrap()
+                .expect("bundle should exist locally after sendBundle");
             if bundle.slot != 0 {
                 break (bundle, context_slot);
             }
@@ -1053,19 +1124,23 @@ mod tests {
 
         let response = setup
             .rpc
-            .get_bundle_statuses(Some(setup.context.clone()), bundle_id.clone())
+            .get_bundle_statuses(Some(setup.context.clone()), vec![bundle_id.clone()])
             .await
-            .expect("getBundleStatuses should succeed")
-            .expect("bundle should exist locally after sendBundle");
+            .expect("getBundleStatuses should succeed");
 
         // Multi-tx bundle must still aggregate into exactly one JitoBundleStatus, with the
         // signatures preserved in submission order.
         assert_eq!(
             response.value.len(),
             1,
-            "multi-tx bundle should still aggregate to a single JitoBundleStatus"
+            "value array must have one entry per requested bundle id"
         );
-        let bundle = response.value.into_iter().next().unwrap();
+        let bundle = response
+            .value
+            .into_iter()
+            .next()
+            .unwrap()
+            .expect("bundle should exist locally after sendBundle");
         assert_eq!(bundle.bundle_id, bundle_id);
         assert_eq!(
             bundle.transactions, expected_sigs,
@@ -1090,7 +1165,8 @@ mod tests {
     fn test_jito_bundle_status_json_shape() {
         use solana_transaction_error::TransactionError;
 
-        // -- Ok case: err must serialize as {"Ok": null} and field names must be camelCase. --
+        // -- Ok case: field names must be snake_case (Jito wire-compatible) and err must
+        // serialize as {"Ok": null}. --
         let ok_status = JitoBundleStatus {
             bundle_id: "abc123".to_string(),
             transactions: vec!["sig1".to_string(), "sig2".to_string()],
@@ -1100,27 +1176,28 @@ mod tests {
         };
         let json = serde_json::to_value(&ok_status).expect("JitoBundleStatus should serialize");
 
-        // Field names must be camelCase per the documented JSON-RPC contract.
+        // Field names must be snake_case per the Jito JSON-RPC contract; these match the keys
+        // produced by Jito's real getBundleStatuses response.
         assert!(
-            json.get("bundleId").is_some(),
-            "expected camelCase `bundleId` field, got: {json}"
+            json.get("bundle_id").is_some(),
+            "expected snake_case `bundle_id` field, got: {json}"
         );
         assert!(json.get("transactions").is_some());
         assert!(json.get("slot").is_some());
         assert!(
-            json.get("confirmationStatus").is_some(),
-            "expected camelCase `confirmationStatus` field, got: {json}"
+            json.get("confirmation_status").is_some(),
+            "expected snake_case `confirmation_status` field, got: {json}"
         );
         assert!(json.get("err").is_some());
 
-        // Snake-case variants must NOT leak through.
+        // camelCase variants must NOT leak through.
         assert!(
-            json.get("bundle_id").is_none(),
-            "snake_case `bundle_id` should not be serialized"
+            json.get("bundleId").is_none(),
+            "camelCase `bundleId` should not be serialized (Jito uses snake_case on the wire)"
         );
         assert!(
-            json.get("confirmation_status").is_none(),
-            "snake_case `confirmation_status` should not be serialized"
+            json.get("confirmationStatus").is_none(),
+            "camelCase `confirmationStatus` should not be serialized"
         );
 
         // err must serialize as {"Ok": null} for a successful bundle.
@@ -1129,12 +1206,12 @@ mod tests {
             Some(&serde_json::json!({ "Ok": null })),
             "Ok variant of err should serialize as {{\"Ok\": null}}"
         );
-        assert_eq!(json.get("bundleId").unwrap().as_str(), Some("abc123"));
+        assert_eq!(json.get("bundle_id").unwrap().as_str(), Some("abc123"));
         assert_eq!(json.get("slot").unwrap().as_u64(), Some(42));
         assert_eq!(
-            json.get("confirmationStatus").unwrap().as_str(),
+            json.get("confirmation_status").unwrap().as_str(),
             Some("finalized"),
-            "confirmationStatus should serialize as a lowercase string"
+            "confirmation_status should serialize as a lowercase string"
         );
 
         // -- Err case: err must serialize as {"Err": ...} carrying the inner TransactionError. --
@@ -1156,5 +1233,71 @@ mod tests {
         let round_tripped: JitoBundleStatus =
             serde_json::from_value(json).expect("JitoBundleStatus should round-trip");
         assert_eq!(round_tripped, ok_status);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_bundle_statuses_batched_known_and_unknown() {
+        // Submit one real bundle, then call getBundleStatuses with a batch containing the real
+        // id plus an unknown id. The response must preserve order and include `null` at the
+        // unknown index, matching Jito's wire contract.
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let setup = TestSetup::new(SurfpoolJitoRpc);
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+
+        let _ = setup
+            .context
+            .svm_locker
+            .0
+            .write()
+            .await
+            .airdrop(&payer.pubkey(), 2 * LAMPORTS_PER_SOL);
+
+        let tx = build_v0_transaction(
+            &payer.pubkey(),
+            &[&payer],
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &recipient,
+                LAMPORTS_PER_SOL,
+            )],
+            &recent_blockhash,
+        );
+        let tx_encoded = bs58::encode(bincode::serialize(&tx).unwrap()).into_string();
+
+        let known_id = setup
+            .rpc
+            .send_bundle(Some(setup.context.clone()), vec![tx_encoded], None)
+            .await
+            .expect("sendBundle should succeed");
+        let unknown_id = "f".repeat(64);
+
+        // Order: [unknown, known] so we also verify positional null-vs-Some mapping isn't
+        // accidentally first-only.
+        let response = setup
+            .rpc
+            .get_bundle_statuses(
+                Some(setup.context.clone()),
+                vec![unknown_id.clone(), known_id.clone()],
+            )
+            .await
+            .expect("getBundleStatuses should succeed");
+
+        assert_eq!(
+            response.value.len(),
+            2,
+            "value must have exactly one entry per requested bundle id"
+        );
+        assert!(
+            response.value[0].is_none(),
+            "index 0 (unknown id) should be null"
+        );
+        let known = response.value[1]
+            .as_ref()
+            .expect("index 1 (known id) should be Some(JitoBundleStatus)");
+        assert_eq!(known.bundle_id, known_id);
     }
 }

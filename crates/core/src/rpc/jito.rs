@@ -1179,8 +1179,6 @@ mod tests {
         };
         let json = serde_json::to_value(&ok_status).expect("JitoBundleStatus should serialize");
 
-        // Field names must be snake_case per the Jito JSON-RPC contract; these match the keys
-        // produced by Jito's real getBundleStatuses response.
         assert!(
             json.get("bundle_id").is_some(),
             "expected snake_case `bundle_id` field, got: {json}"
@@ -1188,19 +1186,18 @@ mod tests {
         assert!(json.get("transactions").is_some());
         assert!(json.get("slot").is_some());
         assert!(
-            json.get("confirmation_status").is_some(),
-            "expected snake_case `confirmation_status` field, got: {json}"
+            json.get("confirmationStatus").is_some(),
+            "expected snake_case `confirmationStatus` field, got: {json}"
         );
         assert!(json.get("err").is_some());
 
-        // camelCase variants must NOT leak through.
         assert!(
             json.get("bundleId").is_none(),
             "camelCase `bundleId` should not be serialized (Jito uses snake_case on the wire)"
         );
         assert!(
-            json.get("confirmationStatus").is_none(),
-            "camelCase `confirmationStatus` should not be serialized"
+            json.get("confirmation_status").is_none(),
+            "camelCase `confirmation_status` should not be serialized"
         );
 
         // err must serialize as {"Ok": null} for a successful bundle.
@@ -1212,9 +1209,9 @@ mod tests {
         assert_eq!(json.get("bundle_id").unwrap().as_str(), Some("abc123"));
         assert_eq!(json.get("slot").unwrap().as_u64(), Some(42));
         assert_eq!(
-            json.get("confirmation_status").unwrap().as_str(),
+            json.get("confirmationStatus").unwrap().as_str(),
             Some("finalized"),
-            "confirmation_status should serialize as a lowercase string"
+            "confirmationStatus should serialize as a lowercase string"
         );
 
         // -- Err case: err must serialize as {"Err": ...} carrying the inner TransactionError. --

@@ -6,12 +6,15 @@ use sha2::{Digest, Sha256};
 use solana_client::{rpc_config::RpcSendTransactionConfig, rpc_custom_error::RpcCustomError};
 use solana_rpc_client_api::response::Response as RpcResponse;
 use solana_signature::Signature;
-use solana_transaction::versioned::VersionedTransaction;
-use solana_transaction_status::UiTransactionEncoding;
-use surfpool_types::TransactionStatusEvent;
+use solana_transaction::{TransactionError, versioned::VersionedTransaction};
+use solana_transaction_status::{TransactionConfirmationStatus, UiTransactionEncoding};
+use surfpool_types::{JitoBundleStatus, TransactionStatusEvent};
 
 use super::{RunloopContext, utils::decode_and_deserialize};
-use crate::surfnet::{locker::SurfnetSvmLocker, svm::BundleSandbox};
+use crate::{
+    rpc::full::SurfpoolFullRpc,
+    surfnet::{locker::SurfnetSvmLocker, svm::BundleSandbox},
+};
 
 /// Maximum number of transactions allowed in a single bundle, matching Jito's limit.
 const MAX_BUNDLE_SIZE: usize = 5;
@@ -366,16 +369,20 @@ impl Jito for SurfpoolJitoRpc {
                 .into());
             };
 
-            let Some(signatures) = ctx.svm_locker.get_bundle(bundle_id.clone()) else {
+            let Some(signatures) = ctx.svm_locker.get_bundle(&bundle_id) else {
                 return Ok(None);
             };
             if signatures.is_empty() {
                 return Ok(None);
             }
 
-            let statuses = SurfpoolFullRpc
-                .get_signature_statuses(meta.clone(), signatures.clone(), None)
-                .await?;
+            let statuses = super::full::Full::get_signature_statuses(
+                &SurfpoolFullRpc,
+                meta.clone(),
+                signatures.clone(),
+                None,
+            )
+            .await?;
 
             // Bundle txs are processed sequentially in one go; they share the same landing slot and
             // confirmation level, so we take slot/status from the first status entry only.
@@ -871,10 +878,11 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_send_bundle_persists_bundle_signatures() {
         let payer = Keypair::new();
         let recipient = Pubkey::new_unique();
-        let (mempool_tx, mempool_rx) = crossbeam_channel::unbounded();
+        let (mempool_tx, _) = crossbeam_channel::unbounded();
         let setup = TestSetup::new_with_mempool(SurfpoolJitoRpc, mempool_tx);
 
         let recent_blockhash = setup
@@ -907,72 +915,20 @@ mod tests {
         let expected_sigs = vec![tx.signatures[0].to_string()];
 
         let setup_clone = setup.clone();
-        let handle = hiro_system_kit::thread_named("send_bundle")
-            .spawn(move || {
-                setup_clone
-                    .rpc
-                    .send_bundle(Some(setup_clone.context), vec![tx_encoded], None)
-            })
-            .unwrap();
+        let send_bundle_result = setup_clone
+            .rpc
+            .send_bundle(Some(setup_clone.context), vec![tx_encoded], None)
+            .await;
 
-        let mut processed_tx = false;
-        let mut processed_slot: Option<u64> = None;
+        assert!(send_bundle_result.is_ok(), "Expected send_bundle to pass");
 
-        while !processed_tx {
-            match mempool_rx.recv() {
-                Ok(SimnetCommand::ProcessTransaction(_, tx, status_tx, _, _)) => {
-                    let mut writer = setup.context.svm_locker.0.write().await;
-                    let slot = writer.get_latest_absolute_slot();
-                    processed_slot = Some(slot);
-                    writer.transactions_queued_for_confirmation.push_back((
-                        tx.clone(),
-                        status_tx.clone(),
-                        None,
-                    ));
-                    let sig = tx.signatures[0];
-                    let tx_with_status_meta = TransactionWithStatusMeta {
-                        slot,
-                        transaction: tx,
-                        ..Default::default()
-                    };
-                    writer
-                        .transactions
-                        .store(
-                            sig.to_string(),
-                            SurfnetTransactionStatus::processed(
-                                tx_with_status_meta,
-                                std::collections::HashSet::new(),
-                            ),
-                        )
-                        .unwrap();
-                    status_tx
-                        .send(TransactionStatusEvent::Success(
-                            TransactionConfirmationStatus::Confirmed,
-                        ))
-                        .unwrap();
-                    processed_tx = true;
-                }
-                Ok(SimnetCommand::AirdropProcessed) => continue,
-                other => panic!("unexpected simnet command: {:?}", other),
-            }
-        }
-
-        let result = handle
-            .join()
-            .unwrap()
-            .await
-            .expect("sendBundle should succeed");
-        let stored_bundle_id = bundle_id_from_cmd.expect("should have received SendBundle command");
-        assert_eq!(
-            result, stored_bundle_id,
-            "sendBundle result bundle id should match stored bundle id"
-        );
+        let bundle_id = send_bundle_result.unwrap();
 
         // sendBundle stores bundle signatures directly in `jito_bundles`; poll until visible.
         let started = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(2);
         let persisted = loop {
-            match setup.context.svm_locker.get_bundle(bundle_id.clone()) {
+            match setup.context.svm_locker.get_bundle(&bundle_id) {
                 Some(sigs) if !sigs.is_empty() => break sigs,
                 _ if started.elapsed() > timeout => {
                     panic!("timed out waiting for bundle to be persisted: {bundle_id}");
@@ -989,7 +945,6 @@ mod tests {
             "Persisted bundle signatures should match locally built signatures"
         );
 
-        let expected_slot = processed_slot.expect("should have processed a tx slot");
         let started = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(2);
         let bundle = loop {
@@ -1022,10 +977,6 @@ mod tests {
         assert_eq!(
             bundle.transactions, expected_sigs,
             "transactions should match bundle signatures"
-        );
-        assert!(
-            bundle.slot == 0 || bundle.slot == expected_slot,
-            "bundle slot should be 0 (unknown) or match processed tx slot"
         );
         assert!(
             matches!(

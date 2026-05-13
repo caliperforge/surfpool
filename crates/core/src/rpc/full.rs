@@ -1590,7 +1590,7 @@ impl Full for SurfpoolFullRpc {
                 config.base.skip_preflight,
                 config.skip_sig_verify,
             ))
-            .map_err(|e| RpcCustomError::NodeUnhealthy {
+            .map_err(|_| RpcCustomError::NodeUnhealthy {
                 num_slots_behind: None,
             })?;
 

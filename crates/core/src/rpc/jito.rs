@@ -947,7 +947,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(2);
-        let bundle = loop {
+        let (bundle, context_slot) = loop {
             let response = setup
                 .rpc
                 .get_bundle_statuses(Some(setup.context.clone()), bundle_id.clone())
@@ -961,17 +961,27 @@ mod tests {
                 "getBundleStatuses should return a single bundle status"
             );
 
+            let context_slot = response.context.slot;
             let bundle = response.value.into_iter().next().unwrap();
             if bundle.slot != 0 {
-                break bundle;
+                break (bundle, context_slot);
             }
 
             if started.elapsed() > timeout {
-                break bundle;
+                break (bundle, context_slot);
             }
 
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
+
+        assert!(
+            context_slot >= bundle.slot,
+            "response.context.slot ({}) should be >= bundle.slot ({}); \
+             getBundleStatuses must surface the same context slot as the \
+             underlying getSignatureStatuses call",
+            context_slot,
+            bundle.slot,
+        );
 
         assert_eq!(bundle.bundle_id, bundle_id, "bundle_id should match");
         assert_eq!(
@@ -988,5 +998,157 @@ mod tests {
             "confirmation_status should be a valid Solana status"
         );
         assert!(bundle.err.is_ok(), "err should be Ok for successful bundle");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_bundle_statuses_multi_transaction_bundle() {
+        let payer = Keypair::new();
+        let recipient1 = Pubkey::new_unique();
+        let recipient2 = Pubkey::new_unique();
+        let setup = TestSetup::new(SurfpoolJitoRpc);
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+
+        let _ = setup
+            .context
+            .svm_locker
+            .0
+            .write()
+            .await
+            .airdrop(&payer.pubkey(), 5 * LAMPORTS_PER_SOL);
+
+        let tx1 = build_v0_transaction(
+            &payer.pubkey(),
+            &[&payer],
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &recipient1,
+                LAMPORTS_PER_SOL,
+            )],
+            &recent_blockhash,
+        );
+        let tx2 = build_v0_transaction(
+            &payer.pubkey(),
+            &[&payer],
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &recipient2,
+                LAMPORTS_PER_SOL,
+            )],
+            &recent_blockhash,
+        );
+
+        let tx1_encoded = bs58::encode(bincode::serialize(&tx1).unwrap()).into_string();
+        let tx2_encoded = bs58::encode(bincode::serialize(&tx2).unwrap()).into_string();
+        let expected_sigs = vec![tx1.signatures[0].to_string(), tx2.signatures[0].to_string()];
+
+        let bundle_id = setup
+            .rpc
+            .send_bundle(
+                Some(setup.context.clone()),
+                vec![tx1_encoded, tx2_encoded],
+                None,
+            )
+            .await
+            .expect("sendBundle should succeed for a valid 2-tx bundle");
+
+        let response = setup
+            .rpc
+            .get_bundle_statuses(Some(setup.context.clone()), bundle_id.clone())
+            .await
+            .expect("getBundleStatuses should succeed")
+            .expect("bundle should exist locally after sendBundle");
+
+        // Multi-tx bundle must still aggregate into exactly one JitoBundleStatus, with the
+        // signatures preserved in submission order.
+        assert_eq!(
+            response.value.len(),
+            1,
+            "multi-tx bundle should still aggregate to a single JitoBundleStatus"
+        );
+        let bundle = response.value.into_iter().next().unwrap();
+        assert_eq!(bundle.bundle_id, bundle_id);
+        assert_eq!(
+            bundle.transactions, expected_sigs,
+            "transactions must preserve submission order across all txs in the bundle"
+        );
+        assert!(bundle.err.is_ok(), "successful multi-tx bundle should report Ok");
+        assert!(
+            matches!(
+                bundle.confirmation_status,
+                SolanaTxConfirmationStatus::Processed
+                    | SolanaTxConfirmationStatus::Confirmed
+                    | SolanaTxConfirmationStatus::Finalized
+            ),
+            "confirmation_status should be a valid Solana status"
+        );
+    }
+
+    #[test]
+    fn test_jito_bundle_status_json_shape() {
+        use solana_transaction_error::TransactionError;
+
+        // -- Ok case: err must serialize as {"Ok": null} and field names must be camelCase. --
+        let ok_status = JitoBundleStatus {
+            bundle_id: "abc123".to_string(),
+            transactions: vec!["sig1".to_string(), "sig2".to_string()],
+            slot: 42,
+            confirmation_status: SolanaTxConfirmationStatus::Finalized,
+            err: Ok(()),
+        };
+        let json = serde_json::to_value(&ok_status).expect("JitoBundleStatus should serialize");
+
+        // Field names must be camelCase per the documented JSON-RPC contract.
+        assert!(json.get("bundleId").is_some(), "expected camelCase `bundleId` field, got: {json}");
+        assert!(json.get("transactions").is_some());
+        assert!(json.get("slot").is_some());
+        assert!(
+            json.get("confirmationStatus").is_some(),
+            "expected camelCase `confirmationStatus` field, got: {json}"
+        );
+        assert!(json.get("err").is_some());
+
+        // Snake-case variants must NOT leak through.
+        assert!(json.get("bundle_id").is_none(), "snake_case `bundle_id` should not be serialized");
+        assert!(
+            json.get("confirmation_status").is_none(),
+            "snake_case `confirmation_status` should not be serialized"
+        );
+
+        // err must serialize as {"Ok": null} for a successful bundle.
+        assert_eq!(
+            json.get("err"),
+            Some(&serde_json::json!({ "Ok": null })),
+            "Ok variant of err should serialize as {{\"Ok\": null}}"
+        );
+        assert_eq!(json.get("bundleId").unwrap().as_str(), Some("abc123"));
+        assert_eq!(json.get("slot").unwrap().as_u64(), Some(42));
+        assert_eq!(
+            json.get("confirmationStatus").unwrap().as_str(),
+            Some("finalized"),
+            "confirmationStatus should serialize as a lowercase string"
+        );
+
+        // -- Err case: err must serialize as {"Err": ...} carrying the inner TransactionError. --
+        let err_status = JitoBundleStatus {
+            bundle_id: "abc123".to_string(),
+            transactions: vec!["sig1".to_string()],
+            slot: 7,
+            confirmation_status: SolanaTxConfirmationStatus::Processed,
+            err: Err(TransactionError::AccountNotFound),
+        };
+        let err_json = serde_json::to_value(&err_status).expect("err variant should serialize");
+        let err_field = err_json.get("err").expect("err field should be present");
+        assert!(
+            err_field.get("Err").is_some(),
+            "Err variant of err should serialize as {{\"Err\": ...}}, got: {err_field}"
+        );
+
+        // Round-trip: deserializing must yield the same struct.
+        let round_tripped: JitoBundleStatus =
+            serde_json::from_value(json).expect("JitoBundleStatus should round-trip");
+        assert_eq!(round_tripped, ok_status);
     }
 }

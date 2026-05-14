@@ -75,7 +75,7 @@ semver = "1.0.28"
 
 [features]
 default = ["cli", "sqlite", "register-tracing"]
-cli = ["clap/derive", "clap/env", "clap/help", "clap/usage", "clap_complete", "toml/parse", "ctrlc", "hiro-system-kit/log"]
+cli = ["clap/derive", "clap/env", "clap/help", "clap/usage", "clap/error-context", "clap/suggestions", "clap/color", "clap_complete", "toml/parse", "ctrlc", "hiro-system-kit/log"]
 supervisor_ui = ["txtx-supervisor-ui"]
 explorer = []
 sqlite = ["surfpool-core/sqlite"]

@@ -59,6 +59,8 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v1-rust
+          cache-bin: false
           workspaces: |
             . -> target
 

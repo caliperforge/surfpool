@@ -31,9 +31,13 @@ pub struct SurfnetLiteSvm {
 }
 
 impl SurfnetLiteSvm {
-    pub fn new(database_url: Option<&str>, surfnet_id: &str) -> SurfpoolResult<Self> {
+    pub fn new(
+        database_url: Option<&str>,
+        surfnet_id: &str,
+        feature_set: FeatureSet,
+    ) -> SurfpoolResult<Self> {
         let mut lite_svm = Self {
-            svm: Self::base_litesvm_settings(),
+            svm: Self::litesvm_settings(feature_set),
             db: None,
         };
 
@@ -61,11 +65,17 @@ impl SurfnetLiteSvm {
         }
     }
 
-    /// Initializes LiteSVM with as few settings as possible; for initial startup of VM
-    /// that will be overriden later when more context is available.
-    fn base_litesvm_settings() -> LiteSVM {
+    /// Builds the inner LiteSVM with `feature_set` fully applied.
+    ///
+    /// Ordering is significant: `with_feature_set` is called first so that the
+    /// subsequent feature-gated setup steps (`with_builtins`, `with_sysvars`,
+    /// `with_default_programs`) see the correct gate state.
+    /// `with_feature_accounts` then writes one on-chain feature account for
+    /// each currently-active feature.
+    fn litesvm_settings(feature_set: FeatureSet) -> LiteSVM {
         LiteSVM::default()
-            .with_feature_set(FeatureSet::default()) // start with all features enabled, but don't load feature accounts
+            .with_feature_set(feature_set)
+            .with_feature_accounts()
             .with_builtins()
             .with_lamports(1_000_000u64.wrapping_mul(LAMPORTS_PER_SOL))
             .with_sysvars()
@@ -73,17 +83,6 @@ impl SurfnetLiteSvm {
             .with_precompiles()
             .with_blockhash_check(false)
             .with_sigverify(false)
-    }
-
-    /// Initializes LiteSVM with full settings; starts with base settings, then adds in
-    /// features and other setup that depends on the feature set.
-    fn full_litesvm_settings(feature_set: FeatureSet) -> LiteSVM {
-        Self::base_litesvm_settings()
-            .with_feature_set(feature_set)
-            .with_feature_accounts()
-            .with_builtins()
-            .with_sysvars()
-            .with_default_programs()
     }
 
     /// Explicitly shutdown the storage, performing cleanup like WAL checkpoint for SQLite.
@@ -94,7 +93,7 @@ impl SurfnetLiteSvm {
     }
 
     pub fn reset(&mut self, feature_set: FeatureSet) -> SurfpoolResult<()> {
-        self.svm = Self::full_litesvm_settings(feature_set);
+        self.svm = Self::litesvm_settings(feature_set);
 
         create_native_mint(self);
 
@@ -123,7 +122,7 @@ impl SurfnetLiteSvm {
         let clock = self.svm.get_sysvar::<Clock>();
 
         // todo: this is also resetting the log bytes limit and airdrop keypair, would be nice to avoid
-        self.svm = Self::full_litesvm_settings(feature_set);
+        self.svm = Self::litesvm_settings(feature_set);
 
         create_native_mint(self);
 
@@ -131,13 +130,6 @@ impl SurfnetLiteSvm {
         self.svm.set_sysvar(&recent_blockhashes);
         self.svm.set_sysvar(&slot_hashes);
         self.svm.set_sysvar(&clock);
-    }
-
-    pub fn apply_feature_config(&mut self, feature_set: FeatureSet) -> &mut Self {
-        self.svm = Self::full_litesvm_settings(feature_set);
-
-        create_native_mint(self);
-        self
     }
 
     pub fn set_log_bytes_limit(&mut self, limit: Option<usize>) {
@@ -379,8 +371,8 @@ mod tests {
     }
 
     #[test]
-    fn test_base_litesvm_settings_registers_ed25519_precompile() {
-        let mut svm = SurfnetLiteSvm::base_litesvm_settings();
+    fn test_litesvm_settings_registers_ed25519_precompile() {
+        let mut svm = SurfnetLiteSvm::litesvm_settings(LiteSVM::mainnet_feature_set());
         let payer = Keypair::new();
         svm.airdrop(&payer.pubkey(), LAMPORTS_PER_SOL)
             .expect("failed to fund test payer");
@@ -390,7 +382,7 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "ed25519 precompile should be available in base_litesvm_settings"
+            "ed25519 precompile should be available via litesvm_settings"
         );
     }
 }

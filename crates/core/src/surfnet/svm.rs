@@ -10,8 +10,11 @@ use base64::{Engine, prelude::BASE64_STANDARD};
 use chrono::Utc;
 use convert_case::Casing;
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use litesvm::types::{
-    FailedTransactionMetadata, SimulatedTransactionInfo, TransactionMetadata, TransactionResult,
+use litesvm::{
+    LiteSVM,
+    types::{
+        FailedTransactionMetadata, SimulatedTransactionInfo, TransactionMetadata, TransactionResult,
+    },
 };
 use solana_account::{Account, AccountSharedData, ReadableAccount};
 use solana_account_decoder::{
@@ -402,6 +405,26 @@ fn commit_overlay_storage<K, V>(
     Ok(())
 }
 
+/// Composes a [`FeatureSet`] from a user-supplied [`SvmFeatureConfig`].
+///
+/// The starting baseline is LiteSVM's mainnet-beta feature set (see
+/// [`LiteSVM::mainnet_feature_set`]); features listed in `config.enable` are
+/// then activated on top, and features in `config.disable` are deactivated.
+/// This is the single source of truth for the "mainnet defaults + deltas"
+/// semantic promised by `SvmFeatureConfig`.
+fn compose_feature_set(config: &SvmFeatureConfig) -> FeatureSet {
+    let mut feature_set = LiteSVM::mainnet_feature_set();
+    for pubkey in &config.enable {
+        debug!("Activating feature {}", pubkey);
+        feature_set.activate(pubkey, 0);
+    }
+    for pubkey in &config.disable {
+        debug!("Deactivating feature {}", pubkey);
+        feature_set.deactivate(pubkey);
+    }
+    feature_set
+}
+
 impl SurfnetSvm {
     pub fn default() -> (Self, Receiver<SimnetEvent>, Receiver<GeyserEvent>) {
         Self::new(SurfnetSvmConfig::default()).unwrap()
@@ -772,7 +795,12 @@ impl SurfnetSvm {
         let (geyser_events_tx, geyser_events_rx) = crossbeam_channel::bounded(1024);
         let surfnet_id = config.surfnet_id;
 
-        let inner = SurfnetLiteSvm::new(database_url, &surfnet_id)?;
+        // Compose the final feature set up front (mainnet baseline +
+        // config.enable - config.disable) so that the inner LiteSVM is
+        // constructed exactly once, with the correct features and feature
+        // accounts loaded. See `compose_feature_set` for the composition rules.
+        let feature_set = compose_feature_set(&config.feature_config);
+        let inner = SurfnetLiteSvm::new(database_url, &surfnet_id, feature_set.clone())?;
 
         let native_mint_account = inner
             .get_account(&spl_token_interface::native_mint::ID)?
@@ -942,7 +970,7 @@ impl SurfnetSvm {
             inflation: Inflation::default(),
             write_version: 0,
             registered_idls: registered_idls_db,
-            feature_set: FeatureSet::default(),
+            feature_set,
             instruction_profiling_enabled: config.instruction_profiling_enabled,
             max_profiles: config.max_profiles,
             skip_blockhash_check: config.skip_blockhash_check,
@@ -958,9 +986,6 @@ impl SurfnetSvm {
             last_checkpoint_slot: 0,
         };
 
-        if config.feature_config != SvmFeatureConfig::default() {
-            svm.apply_feature_config(&config.feature_config);
-        }
         svm.inner.set_log_bytes_limit(config.log_bytes_limit);
         svm.chain_tip = svm.new_blockhash();
         svm.register_builtin_template_idls();
@@ -968,31 +993,6 @@ impl SurfnetSvm {
         svm.reconstruct_sysvars();
 
         Ok((svm, simnet_events_rx, geyser_events_rx))
-    }
-
-    /// Applies the SVM feature configuration to the internal feature set.
-    ///
-    /// This method enables or disables specific SVM features based on the provided configuration.
-    /// Features explicitly listed in `enable` will be activated, and features in `disable` will be deactivated.
-    ///
-    /// # Arguments
-    /// * `config` - The feature configuration specifying which features to enable/disable.
-    pub fn apply_feature_config(&mut self, config: &SvmFeatureConfig) {
-        let mut starting_set = FeatureSet::all_enabled();
-        // Apply explicit enables
-        for pubkey in &config.enable {
-            debug!("Activating feature {}", pubkey);
-            starting_set.activate(pubkey, 0);
-        }
-
-        // Apply explicit disables
-        for pubkey in &config.disable {
-            debug!("Deactivating feature {}", pubkey);
-            starting_set.deactivate(pubkey);
-        }
-        self.feature_set = starting_set;
-        // Rebuild inner VM with updated feature set
-        self.inner.apply_feature_config(self.feature_set.clone());
     }
 
     pub fn increment_write_version(&mut self) -> u64 {
@@ -4687,34 +4687,37 @@ mod tests {
     }
 
     // Feature configuration tests
+    //
+    // Feature sets are now fully determined at SVM construction time (see
+    // `SurfnetSvm::build` and `compose_feature_set`). These tests therefore
+    // construct an SVM with the desired `SvmFeatureConfig` and assert on the
+    // resulting state, rather than mutating an existing SVM.
 
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
     #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
     #[test_case(TestType::no_db(); "with no db")]
     #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
-    fn test_apply_feature_config_empty(test_type: TestType) {
-        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
-        let config = SvmFeatureConfig::new();
+    fn test_feature_set_empty_config_uses_mainnet_baseline(test_type: TestType) {
+        // An empty `SvmFeatureConfig` should yield exactly the mainnet baseline:
+        // features active on mainnet are active; features not active on mainnet
+        // are inactive.
+        let (svm, _events_rx, _geyser_rx) =
+            test_type.initialize_svm_with_features(SvmFeatureConfig::new());
 
-        // Should not panic with empty config
-        svm.apply_feature_config(&config);
+        assert!(svm.feature_set.is_active(&disable_fees_sysvar::id()));
+        assert!(!svm.feature_set.is_active(&enable_loader_v4::id()));
     }
 
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
     #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
     #[test_case(TestType::no_db(); "with no db")]
     #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
-    fn test_apply_feature_config_enable_feature(test_type: TestType) {
-        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
-
-        // Disable a feature first
+    fn test_feature_set_enable_feature(test_type: TestType) {
+        // `enable_loader_v4` is not active on the mainnet baseline; an explicit
+        // enable in the config should turn it on.
         let feature_id = enable_loader_v4::id();
-        svm.feature_set.deactivate(&feature_id);
-        assert!(!svm.feature_set.is_active(&feature_id));
-
-        // Now enable it via config
-        let config = SvmFeatureConfig::new().enable(enable_loader_v4::id());
-        svm.apply_feature_config(&config);
+        let (svm, _events_rx, _geyser_rx) =
+            test_type.initialize_svm_with_features(SvmFeatureConfig::new().enable(feature_id));
 
         assert!(svm.feature_set.is_active(&feature_id));
     }
@@ -4723,20 +4726,13 @@ mod tests {
     #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
     #[test_case(TestType::no_db(); "with no db")]
     #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
-    fn test_apply_feature_config_disable_feature(test_type: TestType) {
-        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
-
-        // Feature should be inactive by default (all_disabled)
+    fn test_feature_set_disable_feature(test_type: TestType) {
+        // `disable_fees_sysvar` is active on the mainnet baseline; an explicit
+        // disable in the config should turn it off.
         let feature_id = disable_fees_sysvar::id();
-        assert!(!svm.feature_set.is_active(&feature_id));
+        let (svm, _events_rx, _geyser_rx) =
+            test_type.initialize_svm_with_features(SvmFeatureConfig::new().disable(feature_id));
 
-        // Now applying feature config defaults to all enabled
-        svm.apply_feature_config(&SvmFeatureConfig::new());
-        assert!(svm.feature_set.is_active(&feature_id));
-
-        // But we can explicitly disable via config
-        let config = SvmFeatureConfig::new().disable(disable_fees_sysvar::id());
-        svm.apply_feature_config(&config);
         assert!(!svm.feature_set.is_active(&feature_id));
     }
 
@@ -4744,13 +4740,13 @@ mod tests {
     #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
     #[test_case(TestType::no_db(); "with no db")]
     #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
-    fn test_apply_feature_config_mainnet_defaults(test_type: TestType) {
-        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
-        let config = SvmFeatureConfig::default_mainnet_features();
+    fn test_feature_set_mainnet_baseline(test_type: TestType) {
+        // Default config → exact mainnet baseline. Spot-check a representative
+        // sample of features on each side of the mainnet activation line.
+        let (svm, _events_rx, _geyser_rx) =
+            test_type.initialize_svm_with_features(SvmFeatureConfig::default());
 
-        svm.apply_feature_config(&config);
-
-        // Features disabled on mainnet should now be inactive
+        // Not active on mainnet → inactive.
         assert!(!svm.feature_set.is_active(&enable_loader_v4::id()));
         assert!(
             !svm.feature_set
@@ -4770,7 +4766,7 @@ mod tests {
                 .is_active(&stake_raise_minimum_delegation_to_1_sol::id())
         );
 
-        // Features active on mainnet should still be active
+        // Active on mainnet → active.
         assert!(svm.feature_set.is_active(&disable_fees_sysvar::id()));
         assert!(svm.feature_set.is_active(&curve25519_syscall_enabled::id()));
         assert!(
@@ -4795,18 +4791,13 @@ mod tests {
     #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
     #[test_case(TestType::no_db(); "with no db")]
     #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
-    fn test_apply_feature_config_mainnet_with_override(test_type: TestType) {
-        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
+    fn test_feature_set_mainnet_with_override(test_type: TestType) {
+        // Mainnet baseline + an explicit enable: the enabled feature should be
+        // active while the rest of the mainnet baseline remains intact.
+        let config = SvmFeatureConfig::default().enable(enable_loader_v4::id());
+        let (svm, _events_rx, _geyser_rx) = test_type.initialize_svm_with_features(config);
 
-        // Start with mainnet defaults, but enable loader v4
-        let config = SvmFeatureConfig::default_mainnet_features().enable(enable_loader_v4::id());
-
-        svm.apply_feature_config(&config);
-
-        // Loader v4 should be enabled despite mainnet defaults
         assert!(svm.feature_set.is_active(&enable_loader_v4::id()));
-
-        // Other mainnet-disabled features should still be disabled
         assert!(!svm.feature_set.is_active(&blake3_syscall_enabled::id()));
         assert!(
             !svm.feature_set
@@ -4818,16 +4809,14 @@ mod tests {
     #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
     #[test_case(TestType::no_db(); "with no db")]
     #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
-    fn test_apply_feature_config_multiple_changes(test_type: TestType) {
-        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
-
+    fn test_feature_set_multiple_changes(test_type: TestType) {
         let config = SvmFeatureConfig::new()
             .enable(enable_loader_v4::id())
             .enable(enable_sbpf_v2_deployment_and_execution::id())
             .disable(disable_fees_sysvar::id())
             .disable(blake3_syscall_enabled::id());
 
-        svm.apply_feature_config(&config);
+        let (svm, _events_rx, _geyser_rx) = test_type.initialize_svm_with_features(config);
 
         assert!(svm.feature_set.is_active(&enable_loader_v4::id()));
         assert!(
@@ -4842,47 +4831,18 @@ mod tests {
     #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
     #[test_case(TestType::no_db(); "with no db")]
     #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
-    fn test_apply_feature_config_preserves_native_mint(test_type: TestType) {
-        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
-
-        // Native mint should exist before
-        assert!(
-            svm.inner
-                .get_account(&spl_token_interface::native_mint::ID)
-                .unwrap()
-                .is_some()
-        );
-
+    fn test_feature_set_native_mint_present(test_type: TestType) {
+        // Native mint must exist on a freshly constructed SVM regardless of
+        // whether the user supplied feature overrides.
         let config = SvmFeatureConfig::new().disable(disable_fees_sysvar::id());
-        svm.apply_feature_config(&config);
+        let (svm, _events_rx, _geyser_rx) = test_type.initialize_svm_with_features(config);
 
-        // Native mint should still exist after (re-added in apply_feature_config)
         assert!(
             svm.inner
                 .get_account(&spl_token_interface::native_mint::ID)
                 .unwrap()
                 .is_some()
         );
-    }
-
-    #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
-    #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
-    #[test_case(TestType::no_db(); "with no db")]
-    #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
-    fn test_apply_feature_config_idempotent(test_type: TestType) {
-        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
-
-        let config = SvmFeatureConfig::new()
-            .enable(enable_loader_v4::id())
-            .disable(disable_fees_sysvar::id());
-
-        // Apply twice
-        svm.apply_feature_config(&config);
-        svm.apply_feature_config(&config);
-
-        // State should be the same
-        assert!(svm.feature_set.is_active(&enable_loader_v4::id()));
-        assert!(!svm.feature_set.is_active(&disable_fees_sysvar::id()));
     }
 
     // Garbage collection tests

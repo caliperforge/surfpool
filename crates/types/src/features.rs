@@ -107,72 +107,35 @@ pub fn parse_feature_pubkey(s: &str) -> Result<Pubkey, String> {
     Ok(pubkey)
 }
 
-/// Configuration for SVM features, specifying which features to enable or disable.
+/// Overrides applied on top of LiteSVM's mainnet-beta feature baseline.
+///
+/// surfpool's SVM is constructed with the mainnet-beta feature set already
+/// active (see [`litesvm::LiteSVM::mainnet_feature_set`]). This struct
+/// expresses the user's deltas relative to that baseline:
+///
+/// * features listed in [`enable`](Self::enable) are activated on top of the
+///   mainnet baseline (typically features that have not yet shipped to
+///   mainnet);
+/// * features listed in [`disable`](Self::disable) are deactivated from the
+///   mainnet baseline (typically to reproduce older program behavior).
+///
+/// The default value is an empty override set, meaning "run with exactly the
+/// mainnet baseline."
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SvmFeatureConfig {
-    /// Features to explicitly enable (override defaults)
+    /// Features to activate on top of the mainnet baseline.
     pub enable: Vec<Pubkey>,
-    /// Features to explicitly disable (override defaults)
+    /// Features to deactivate from the mainnet baseline.
     pub disable: Vec<Pubkey>,
 }
 
 impl SvmFeatureConfig {
-    /// Creates a new empty feature configuration.
+    /// Creates an empty override set (i.e. "mainnet baseline, no overrides").
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Returns the default mainnet feature configuration.
-    ///
-    /// This reflects features currently active on Solana mainnet-beta.
-    /// Note: This may need periodic updates as mainnet features change.
-    /// Last updated: 2026-05-05 (queried from mainnet RPC)
-    pub fn default_mainnet_features() -> Self {
-        use agave_feature_set::*;
-
-        // Features that are NOT yet active on mainnet (should be disabled)
-        let disable = vec![
-            // Account data direct mapping not yet on mainnet
-            account_data_direct_mapping::id(),
-            // Blake3 syscall not yet on mainnet
-            blake3_syscall_enabled::id(),
-            // Legacy vote deprecation not yet on mainnet
-            deprecate_legacy_vote_ixs::id(),
-            // SBPF v0 disable not yet on mainnet
-            disable_sbpf_v0_execution::id(),
-            // big_mod_exp syscall not yet on mainnet
-            enable_big_mod_exp_syscall::id(),
-            // Extended program checked not yet on mainnet
-            enable_extend_program_checked::id(),
-            // Loader v4 not yet on mainnet
-            enable_loader_v4::id(),
-            // SBPF v3 not yet on mainnet (v1 and v2 ARE active)
-            enable_sbpf_v3_deployment_and_execution::id(),
-            // Increase tx account lock limit to 128 not yet on mainnet
-            increase_tx_account_lock_limit::id(),
-            // CPI nesting limit raise to 8 not yet on mainnet
-            raise_cpi_nesting_limit_to_8::id(),
-            // SBPF v0 reenable not yet on mainnet
-            reenable_sbpf_v0_execution::id(),
-            // ZK ElGamal reenable not yet on mainnet (disable IS active)
-            reenable_zk_elgamal_proof_program::id(),
-            // remaining_compute_units syscall not yet on mainnet
-            remaining_compute_units_syscall_enabled::id(),
-            // SPL token / p-token replacement not yet on mainnet
-            replace_spl_token_with_p_token::id(),
-            // Stake minimum delegation raise not yet on mainnet
-            stake_raise_minimum_delegation_to_1_sol::id(),
-            // Stricter ABI and runtime constraints not yet on mainnet
-            stricter_abi_and_runtime_constraints::id(),
-        ];
-
-        Self {
-            enable: vec![],
-            disable,
-        }
-    }
-
-    /// Adds a feature to enable.
+    /// Adds a feature to enable on top of the mainnet baseline.
     pub fn enable(mut self, feature: Pubkey) -> Self {
         if !self.enable.contains(&feature) {
             self.enable.push(feature);
@@ -182,7 +145,7 @@ impl SvmFeatureConfig {
         self
     }
 
-    /// Adds a feature to disable.
+    /// Adds a feature to disable from the mainnet baseline.
     pub fn disable(mut self, feature: Pubkey) -> Self {
         if !self.disable.contains(&feature) {
             self.disable.push(feature);
@@ -349,114 +312,6 @@ mod tests {
         );
         assert_eq!(config.enable.len(), 2);
         assert_eq!(config.disable.len(), 2);
-    }
-
-    // ==================== Mainnet defaults tests ====================
-
-    #[test]
-    fn test_mainnet_features_disabled_list() {
-        let config = SvmFeatureConfig::default_mainnet_features();
-
-        assert_eq!(
-            config.is_enabled(&blake3_syscall_enabled::id()),
-            Some(false)
-        );
-        assert_eq!(
-            config.is_enabled(&deprecate_legacy_vote_ixs::id()),
-            Some(false)
-        );
-        assert_eq!(
-            config.is_enabled(&disable_sbpf_v0_execution::id()),
-            Some(false)
-        );
-        assert_eq!(
-            config.is_enabled(&reenable_sbpf_v0_execution::id()),
-            Some(false)
-        );
-        assert_eq!(
-            config.is_enabled(&reenable_zk_elgamal_proof_program::id()),
-            Some(false)
-        );
-        assert_eq!(
-            config.is_enabled(&enable_extend_program_checked::id()),
-            Some(false)
-        );
-        assert_eq!(config.is_enabled(&enable_loader_v4::id()), Some(false));
-        assert_eq!(
-            config.is_enabled(&enable_sbpf_v3_deployment_and_execution::id()),
-            Some(false)
-        );
-        assert_eq!(
-            config.is_enabled(&raise_cpi_nesting_limit_to_8::id()),
-            Some(false)
-        );
-        assert_eq!(
-            config.is_enabled(&account_data_direct_mapping::id()),
-            Some(false)
-        );
-        assert_eq!(
-            config.is_enabled(&stake_raise_minimum_delegation_to_1_sol::id()),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn test_mainnet_features_has_no_enables() {
-        let config = SvmFeatureConfig::default_mainnet_features();
-        assert!(config.enable.is_empty());
-    }
-
-    #[test]
-    fn test_mainnet_features_override_with_enable() {
-        let config = SvmFeatureConfig::default_mainnet_features().enable(enable_loader_v4::id());
-
-        assert_eq!(config.is_enabled(&enable_loader_v4::id()), Some(true));
-        assert_eq!(
-            config.is_enabled(&blake3_syscall_enabled::id()),
-            Some(false)
-        );
-        assert_eq!(
-            config.is_enabled(&enable_extend_program_checked::id()),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn test_mainnet_features_active_features_not_in_disable() {
-        let config = SvmFeatureConfig::default_mainnet_features();
-
-        // Features that ARE active on mainnet should not be in disable list
-        assert_eq!(config.is_enabled(&disable_fees_sysvar::id()), None);
-        assert_eq!(config.is_enabled(&curve25519_syscall_enabled::id()), None);
-        assert_eq!(config.is_enabled(&enable_alt_bn128_syscall::id()), None);
-        assert_eq!(config.is_enabled(&enable_poseidon_syscall::id()), None);
-        assert_eq!(
-            config.is_enabled(&enable_sbpf_v1_deployment_and_execution::id()),
-            None
-        );
-        assert_eq!(
-            config.is_enabled(&enable_sbpf_v2_deployment_and_execution::id()),
-            None
-        );
-        assert_eq!(
-            config.is_enabled(&disable_zk_elgamal_proof_program::id()),
-            None
-        );
-        assert_eq!(config.is_enabled(&vote_state_v4::id()), None);
-        assert_eq!(config.is_enabled(&poseidon_enforce_padding::id()), None);
-        assert_eq!(
-            config.is_enabled(&deprecate_rent_exemption_threshold::id()),
-            None
-        );
-        assert_eq!(
-            config.is_enabled(&move_precompile_verification_to_svm::id()),
-            None
-        );
-        assert_eq!(
-            config.is_enabled(&remove_accounts_executable_flag_checks::id()),
-            None
-        );
-        assert_eq!(config.is_enabled(&loosen_cpi_size_restriction::id()), None);
     }
 
     // ==================== Serialization tests ====================

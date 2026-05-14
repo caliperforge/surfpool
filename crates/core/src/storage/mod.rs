@@ -294,7 +294,7 @@ pub mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use crossbeam_channel::Receiver;
-    use surfpool_types::SimnetEvent;
+    use surfpool_types::{SimnetEvent, SvmFeatureConfig};
     use uuid::Uuid;
 
     use crate::surfnet::{
@@ -325,12 +325,26 @@ pub mod tests {
 
     impl TestType {
         pub fn initialize_svm(&self) -> (SurfnetSvm, Receiver<SimnetEvent>, Receiver<GeyserEvent>) {
+            self.initialize_svm_with_features(SvmFeatureConfig::default())
+        }
+
+        /// Like [`initialize_svm`], but constructs the SVM with a custom
+        /// [`SvmFeatureConfig`] applied at build time.
+        pub fn initialize_svm_with_features(
+            &self,
+            feature_config: SvmFeatureConfig,
+        ) -> (SurfnetSvm, Receiver<SimnetEvent>, Receiver<GeyserEvent>) {
             match &self {
-                TestType::NoDb => SurfnetSvm::default(),
+                TestType::NoDb => SurfnetSvm::new(SurfnetSvmConfig {
+                    feature_config,
+                    ..SurfnetSvmConfig::default()
+                })
+                .unwrap(),
                 TestType::InMemorySqlite => SurfnetSvm::new_with_db(
                     Some(":memory:"),
                     SurfnetSvmConfig {
                         surfnet_id: "0".to_string(),
+                        feature_config,
                         ..SurfnetSvmConfig::default()
                     },
                 )
@@ -339,6 +353,7 @@ pub mod tests {
                     Some(db_path.as_ref()),
                     SurfnetSvmConfig {
                         surfnet_id: "0".to_string(),
+                        feature_config,
                         ..SurfnetSvmConfig::default()
                     },
                 )
@@ -348,6 +363,7 @@ pub mod tests {
                     Some(url.as_ref()),
                     SurfnetSvmConfig {
                         surfnet_id: surfnet_id.clone(),
+                        feature_config,
                         ..SurfnetSvmConfig::default()
                     },
                 )

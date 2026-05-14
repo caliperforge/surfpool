@@ -589,8 +589,9 @@ impl StartSimnet {
             }
             cfg
         } else {
-            // Use mainnet defaults by default
-            SvmFeatureConfig::default_mainnet_features()
+            // No overrides → run with the mainnet baseline (applied by LiteSVM
+            // when the SVM is constructed).
+            SvmFeatureConfig::default()
         };
 
         // Apply explicit enables (these override defaults)

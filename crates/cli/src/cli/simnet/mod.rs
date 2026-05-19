@@ -76,13 +76,15 @@ pub async fn handle_start_local_surfnet_command(
 
     // We start the simnet as soon as possible, as it needs to be ready for deployments
     let (surfnet_svm, simnet_events_rx, geyser_events_rx) =
-        SurfnetSvm::new_with_db(cmd.db.as_deref(), cmd.svm_config())
+        SurfnetSvm::new_with_db(cmd.accounts.db.as_deref(), cmd.svm_config())
             .map_err(|e| format!("Failed to initialize Surfnet SVM: {}", e))?;
     #[cfg(feature = "prometheus")]
     {
-        if cmd.metrics_enabled {
-            match surfpool_core::telemetry::init_from_config(cmd.metrics_enabled, &cmd.metrics_addr)
-            {
+        if cmd.observability.metrics_enabled {
+            match surfpool_core::telemetry::init_from_config(
+                cmd.observability.metrics_enabled,
+                &cmd.observability.metrics_addr,
+            ) {
                 Err(e) => {
                     let _ = surfnet_svm
                         .simnet_events_tx
@@ -91,7 +93,7 @@ pub async fn handle_start_local_surfnet_command(
                 Ok(_) => {
                     let _ = surfnet_svm.simnet_events_tx.send(SimnetEvent::info(format!(
                         "Metrics available at http://{}/metrics",
-                        cmd.metrics_addr
+                        cmd.observability.metrics_addr
                     )));
                 }
             }
@@ -104,7 +106,7 @@ pub async fn handle_start_local_surfnet_command(
     // Check aidrop addresses
     let (mut airdrop_addresses, airdrop_events) = cmd.get_airdrop_addresses();
 
-    let breaker = if cmd.no_tui {
+    let breaker = if cmd.runtime.no_tui {
         None
     } else {
         let keypair = Keypair::new();
@@ -120,7 +122,7 @@ pub async fn handle_start_local_surfnet_command(
             Option<surfpool_types::AccountSnapshot>,
         > = std::collections::BTreeMap::new();
 
-        for snapshot_path in &cmd.snapshot {
+        for snapshot_path in &cmd.accounts.snapshot {
             let file_location = FileLocation::from_path(std::path::PathBuf::from(snapshot_path));
             let content = file_location
                 .read_content_as_utf8()
@@ -191,7 +193,7 @@ pub async fn handle_start_local_surfnet_command(
         sanitized_config.clone(),
         subgraph_events_tx.clone(),
         ctx,
-        !cmd.no_studio,
+        !cmd.runtime.no_studio,
     )
     .await
     {
@@ -254,7 +256,7 @@ pub async fn handle_start_local_surfnet_command(
 
     let simnet_commands_tx_copy = simnet_commands_tx.clone();
     let mut deploy_progress_rx = vec![];
-    if !cmd.no_deploy {
+    if !cmd.project.no_deploy {
         match write_and_execute_iac(&cmd, &simnet_events_tx, &simnet_commands_tx_copy).await {
             Ok(rx) => deploy_progress_rx.push(rx),
             Err(e) => {
@@ -269,7 +271,7 @@ pub async fn handle_start_local_surfnet_command(
     #[cfg(feature = "version_check")]
     {
         let mut local_version = env!("CARGO_PKG_VERSION").to_string();
-        if cmd.ci {
+        if cmd.runtime.ci {
             local_version = format!("{}-ci", local_version);
         }
         let response = txtx_gql::kit::reqwest::get(format!(
@@ -374,15 +376,15 @@ async fn start_service(
     runloop_terminator: Option<Arc<AtomicBool>>,
     initial_transactions: u64,
 ) -> Result<(), String> {
-    let displayed_url = if cmd.no_studio {
+    let displayed_url = if cmd.runtime.no_studio {
         DisplayedUrl::Datasource(sanitized_config)
     } else {
         DisplayedUrl::Studio(sanitized_config)
     };
-    let include_debug_logs = cmd.log_level.to_lowercase().eq("debug");
+    let include_debug_logs = cmd.observability.log_level.to_lowercase().eq("debug");
 
     // Start frontend - kept on main thread
-    if cmd.daemon || cmd.no_tui {
+    if cmd.runtime.daemon || cmd.runtime.no_tui {
         log_events(
             simnet_events_rx,
             subgraph_events_rx,
@@ -581,7 +583,7 @@ fn log_events(
 /// How a simnet session decides to execute its deployment runbooks.
 ///
 /// Classifies the three runtime inputs that steer execution
-/// (`cmd.artifacts_path.is_some()`, `cmd.anchor_compat`, whether a `txtx.yml`
+/// (`cmd.project.artifacts_path.is_some()`, `cmd.project.anchor_compat`, whether a `txtx.yml`
 /// exists at the simnet's base location) into a single variant. Downstream
 /// callers `match` on the variant instead of recomputing compound boolean
 /// predicates at each decision site.
@@ -624,30 +626,30 @@ async fn write_and_execute_iac(
     let (progress_tx, progress_rx) = crossbeam::channel::unbounded();
 
     let base_location =
-        FileLocation::from_path_string(&cmd.manifest_path)?.get_parent_location()?;
+        FileLocation::from_path_string(&cmd.project.manifest_path)?.get_parent_location()?;
     let mut txtx_manifest_location = base_location.clone();
     txtx_manifest_location.append_path("txtx.yml")?;
     let txtx_manifest_exists = txtx_manifest_location.exists();
 
     let mut on_disk_runbook_data = None;
     let mut in_memory_runbook_data = None;
-    let runbook_input = cmd.runbook_input.clone();
+    let runbook_input = cmd.project.runbook_input.clone();
 
     let mode = RunbookExecutionMode::from_inputs(
-        cmd.artifacts_path.is_some(),
-        cmd.anchor_compat,
+        cmd.project.artifacts_path.is_some(),
+        cmd.project.anchor_compat,
         txtx_manifest_exists,
     );
 
     if mode == RunbookExecutionMode::ExistingOnDisk {
-        on_disk_runbook_data = Some((txtx_manifest_location.clone(), cmd.runbooks.clone()));
+        on_disk_runbook_data = Some((txtx_manifest_location.clone(), cmd.project.runbooks.clone()));
     }
 
     // Are we in a project directory?
     if let Ok(deployment) = detect_program_frameworks(
-        &cmd.manifest_path,
-        &cmd.anchor_test_config_paths,
-        cmd.artifacts_path.as_deref(),
+        &cmd.project.manifest_path,
+        &cmd.project.anchor_test_config_paths,
+        cmd.project.artifacts_path.as_deref(),
     )
     .await
     {
@@ -682,10 +684,10 @@ async fn write_and_execute_iac(
                         &framework,
                         &programs,
                         &base_location,
-                        cmd.skip_runbook_generation_prompts,
+                        cmd.project.skip_runbook_generation_prompts,
                     )?;
                     on_disk_runbook_data =
-                        Some((txtx_manifest_location.clone(), cmd.runbooks.clone()));
+                        Some((txtx_manifest_location.clone(), cmd.project.runbooks.clone()));
                 }
                 RunbookExecutionMode::InMemory => {
                     in_memory_runbook_data = Some(scaffold_in_memory_iac(
@@ -694,7 +696,7 @@ async fn write_and_execute_iac(
                         &genesis_accounts,
                         &accounts,
                         &accounts_dir,
-                        cmd.artifacts_path.as_deref(),
+                        cmd.project.artifacts_path.as_deref(),
                     )?);
                 }
                 RunbookExecutionMode::ExistingOnDisk => {}
@@ -717,8 +719,8 @@ async fn write_and_execute_iac(
             })
             .map_err(|e| format!("Thread to execute runbooks exited: {}", e))?;
 
-        if cmd.watch {
-            let artifacts_path_for_watch = cmd.artifacts_path.clone();
+        if cmd.project.watch {
+            let artifacts_path_for_watch = cmd.project.artifacts_path.clone();
             let _handle = hiro_system_kit::thread_named("Watch Filesystem")
                 .spawn(move || {
                     let mut target_path = base_location.clone();

@@ -8,10 +8,8 @@ use jsonrpc_core::{
     futures::future::{self, join_all},
 };
 use jsonrpc_core_client::transports::http;
-use openssl::{
-    bn::BigNumContext,
-    ec::{EcGroup, EcKey, PointConversionForm},
-    nid::Nid,
+use p256::ecdsa::{
+    Signature as P256Signature, SigningKey, VerifyingKey, signature::Signer as P256Signer,
 };
 use solana_account::Account;
 use solana_account_decoder::{UiAccountData, UiAccountEncoding, parse_account_data::ParsedAccount};
@@ -39,9 +37,7 @@ use solana_secp256k1_program::{
     eth_address_from_pubkey, new_secp256k1_instruction_with_signature,
     sign_message as sign_secp256k1_message,
 };
-use solana_secp256r1_program::{
-    new_secp256r1_instruction_with_signature, sign_message as sign_secp256r1_message,
-};
+use solana_secp256r1_program::new_secp256r1_instruction_with_signature;
 use solana_signer::Signer;
 use solana_system_interface::{
     instruction as system_instruction, instruction::transfer, program as system_program,
@@ -802,21 +798,14 @@ fn build_secp256r1_precompile_transaction(
     recent_blockhash: Hash,
 ) -> VersionedTransaction {
     let message = b"surfpool secp256r1 precompile check";
-    let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)
-        .expect("failed to create secp256r1 curve group");
-    let signing_key = EcKey::generate(&group).expect("failed to generate secp256r1 key");
-    let signature = sign_secp256r1_message(
-        message,
-        &signing_key
-            .private_key_to_der()
-            .expect("failed to serialize secp256r1 private key"),
-    )
-    .expect("failed to sign secp256r1 message");
-    let mut ctx = BigNumContext::new().expect("failed to create OpenSSL context");
-    let public_key: [u8; 33] = signing_key
-        .public_key()
-        .to_bytes(&group, PointConversionForm::COMPRESSED, &mut ctx)
-        .expect("failed to serialize secp256r1 public key")
+    let signing_key =
+        SigningKey::from_bytes(&[1u8; 32].into()).expect("valid secp256r1 private key");
+    let signature: P256Signature = signing_key.sign(message);
+    let signature = signature.normalize_s().unwrap_or(signature);
+    let signature: [u8; 64] = signature.to_bytes().into();
+    let public_key: [u8; 33] = VerifyingKey::from(&signing_key)
+        .to_encoded_point(true)
+        .as_bytes()
         .try_into()
         .expect("valid compressed secp256r1 public key");
     let secp256r1_ix = new_secp256r1_instruction_with_signature(message, &signature, &public_key);

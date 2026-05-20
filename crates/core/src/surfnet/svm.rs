@@ -449,6 +449,7 @@ impl SurfnetSvm {
         self.inner.shutdown();
         self.blocks.shutdown();
         self.transactions.shutdown();
+        self.jito_bundles.shutdown();
         self.token_accounts.shutdown();
         self.token_mints.shutdown();
         self.accounts_by_owner.shutdown();
@@ -462,6 +463,8 @@ impl SurfnetSvm {
         self.simulated_transaction_profiles.shutdown();
         self.executed_transaction_profiles.shutdown();
         self.account_associated_data.shutdown();
+        self.offline_accounts.shutdown();
+        self.slot_checkpoint.shutdown();
     }
 
     /// Creates a clone of the SVM with overlay storage wrappers for all database-backed fields.
@@ -885,48 +888,77 @@ impl SurfnetSvm {
                 move || Box::new(FifoMap::<String, KeyedProfileResult>::new(max_profiles)),
             )?
         };
+        let epoch_schedule = Self::default_epoch_schedule();
+        let mut epoch_info = Self::default_epoch_info(&epoch_schedule);
+        let default_genesis_slot = epoch_info.absolute_slot;
         let slot_checkpoint_db: Box<dyn Storage<String, u64>> =
             new_kv_store(&database_url, "slot_checkpoint", &surfnet_id)?;
 
-        // Recover chain state: prefer slot checkpoint, fall back to max block in DB
+        // Recover chain state: prefer slot checkpoint, fall back to max block in DB.
         let checkpoint_slot = slot_checkpoint_db.get(&"latest_slot".to_string())?;
         let max_block_slot = blocks_db
             .into_iter()
             .unwrap()
             .max_by_key(|(slot, _): &(u64, BlockHeader)| *slot);
+        let has_persisted_chain_state = checkpoint_slot.is_some() || max_block_slot.is_some();
 
-        let chain_tip = match (checkpoint_slot, max_block_slot) {
-            // Prefer checkpoint if it's higher than the max stored block
-            (Some(checkpoint), Some((block_slot, block))) => {
-                if checkpoint > block_slot {
-                    // Use checkpoint slot with synthetic blockhash
+        let (chain_tip, recovered_slot, recovered_block_height) =
+            match (checkpoint_slot, max_block_slot) {
+                // Prefer checkpoint if it's higher than the max stored block.
+                (Some(checkpoint), Some((block_slot, block))) => {
+                    if checkpoint > block_slot {
+                        (
+                            BlockIdentifier {
+                                index: checkpoint,
+                                hash: SyntheticBlockhash::new(checkpoint).to_string(),
+                            },
+                            checkpoint,
+                            checkpoint,
+                        )
+                    } else {
+                        (
+                            BlockIdentifier {
+                                index: block.block_height,
+                                hash: block.hash,
+                            },
+                            block_slot,
+                            block.block_height,
+                        )
+                    }
+                }
+                (Some(checkpoint), None) => (
                     BlockIdentifier {
                         index: checkpoint,
                         hash: SyntheticBlockhash::new(checkpoint).to_string(),
-                    }
-                } else {
-                    // Use the stored block
+                    },
+                    checkpoint,
+                    checkpoint,
+                ),
+                (None, Some((block_slot, block))) => (
                     BlockIdentifier {
                         index: block.block_height,
                         hash: block.hash,
-                    }
-                }
-            }
-            (Some(checkpoint), None) => BlockIdentifier {
-                index: checkpoint,
-                hash: SyntheticBlockhash::new(checkpoint).to_string(),
-            },
-            (None, Some((_, block))) => BlockIdentifier {
-                index: block.block_height,
-                hash: block.hash,
-            },
-            (None, None) => BlockIdentifier::zero(),
-        };
+                    },
+                    block_slot,
+                    block.block_height,
+                ),
+                (None, None) => (
+                    BlockIdentifier::zero(),
+                    epoch_info.absolute_slot,
+                    epoch_info.block_height,
+                ),
+            };
+
+        if has_persisted_chain_state {
+            let (epoch, slot_index) = epoch_schedule.get_epoch_and_slot_index(recovered_slot);
+            epoch_info.epoch = epoch;
+            epoch_info.slot_index = slot_index;
+            epoch_info.absolute_slot = recovered_slot;
+            epoch_info.block_height = recovered_block_height;
+        }
 
         // Initialize transactions_processed from database count for persistent storage
         let transactions_processed = transactions_db.count()?;
-        let epoch_schedule = Self::default_epoch_schedule();
-        let epoch_info = Self::default_epoch_info(&epoch_schedule);
         let updated_at = Utc::now().timestamp_millis() as u64;
 
         let mut svm = Self {
@@ -980,14 +1012,16 @@ impl SurfnetSvm {
             recent_blockhashes: VecDeque::new(),
             scheduled_overrides: scheduled_overrides_db,
             offline_accounts: offline_accounts_db,
-            genesis_slot: epoch_info.absolute_slot,
+            genesis_slot: default_genesis_slot,
             genesis_updated_at: updated_at,
             slot_checkpoint: slot_checkpoint_db,
-            last_checkpoint_slot: 0,
+            last_checkpoint_slot: checkpoint_slot.unwrap_or(0),
         };
 
         svm.inner.set_log_bytes_limit(config.log_bytes_limit);
-        svm.chain_tip = svm.new_blockhash();
+        if !has_persisted_chain_state {
+            svm.chain_tip = svm.new_blockhash();
+        }
         svm.register_builtin_template_idls();
         svm.inner.set_sysvar(&epoch_schedule);
         svm.reconstruct_sysvars();
@@ -4551,6 +4585,46 @@ mod tests {
         let (svm, _events_rx, _geyser_rx) =
             SurfnetSvm::new_with_db(Some(":memory:"), SurfnetSvmConfig::default()).unwrap();
         assert!(svm.inner.db.is_some());
+    }
+
+    #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+    #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+    fn test_new_with_db_restores_slot_checkpoint(test_type: TestType) {
+        let (database_url, surfnet_id) = match &test_type {
+            TestType::OnDiskSqlite(db_path) => {
+                (db_path.as_str(), "slot-checkpoint-recovery".to_string())
+            }
+            #[cfg(feature = "postgres")]
+            TestType::Postgres { url, surfnet_id } => (url.as_str(), surfnet_id.clone()),
+            _ => unreachable!("test case must provide persistent database storage"),
+        };
+        let config = SurfnetSvmConfig {
+            surfnet_id,
+            ..SurfnetSvmConfig::default()
+        };
+        let checkpoint_slot = (*CHECKPOINT_INTERVAL_SLOTS).max(FINALIZATION_SLOT_THRESHOLD);
+
+        {
+            let (mut svm, _events_rx, _geyser_rx) =
+                SurfnetSvm::new_with_db(Some(database_url), config.clone()).unwrap();
+            while svm.get_latest_absolute_slot() <= checkpoint_slot {
+                svm.confirm_current_block().unwrap();
+            }
+
+            assert_eq!(
+                svm.slot_checkpoint.get(&"latest_slot".to_string()).unwrap(),
+                Some(checkpoint_slot)
+            );
+            svm.shutdown();
+        }
+
+        let (svm, _events_rx, _geyser_rx) =
+            SurfnetSvm::new_with_db(Some(database_url), config).unwrap();
+        assert_eq!(svm.get_latest_absolute_slot(), checkpoint_slot);
+        assert_eq!(svm.latest_epoch_info.block_height, checkpoint_slot);
+
+        let clock = svm.inner.get_sysvar::<Clock>();
+        assert_eq!(clock.slot, checkpoint_slot);
     }
 
     #[test]

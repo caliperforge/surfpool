@@ -8,6 +8,11 @@ use jsonrpc_core::{
     futures::future::{self, join_all},
 };
 use jsonrpc_core_client::transports::http;
+use openssl::{
+    bn::BigNumContext,
+    ec::{EcGroup, EcKey, PointConversionForm},
+    nid::Nid,
+};
 use solana_account::Account;
 use solana_account_decoder::{UiAccountData, UiAccountEncoding, parse_account_data::ParsedAccount};
 use solana_address_lookup_table_interface::state::{AddressLookupTable, LookupTableMeta};
@@ -30,6 +35,13 @@ use solana_message::{
 };
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::Response as RpcResponse;
+use solana_secp256k1_program::{
+    eth_address_from_pubkey, new_secp256k1_instruction_with_signature,
+    sign_message as sign_secp256k1_message,
+};
+use solana_secp256r1_program::{
+    new_secp256r1_instruction_with_signature, sign_message as sign_secp256r1_message,
+};
 use solana_signer::Signer;
 use solana_system_interface::{
     instruction as system_instruction, instruction::transfer, program as system_program,
@@ -758,6 +770,199 @@ async fn test_simulate_transaction_no_signers(test_type: TestType) {
         simulation_res.value.loaded_accounts_data_size.unwrap() > 0,
         "Expected loaded_accounts_data_size to be greater than 0"
     );
+}
+
+fn build_secp256k1_precompile_transaction(
+    payer: &Keypair,
+    recent_blockhash: Hash,
+) -> VersionedTransaction {
+    let secp256k1_secret_key =
+        libsecp256k1::SecretKey::parse_slice(&[1; 32]).expect("valid secp256k1 private key");
+    let secp256k1_public_key = libsecp256k1::PublicKey::from_secret_key(&secp256k1_secret_key);
+    let eth_address = eth_address_from_pubkey(
+        &secp256k1_public_key.serialize()[1..]
+            .try_into()
+            .expect("valid secp256k1 public key"),
+    );
+    let message = b"surfpool secp256k1 precompile check";
+    let (signature, recovery_id) =
+        sign_secp256k1_message(&secp256k1_secret_key.serialize(), message)
+            .expect("failed to sign secp256k1 message");
+    let secp256k1_ix =
+        new_secp256k1_instruction_with_signature(message, &signature, recovery_id, &eth_address);
+    let tx_message =
+        Message::new_with_blockhash(&[secp256k1_ix], Some(&payer.pubkey()), &recent_blockhash);
+
+    VersionedTransaction::try_new(VersionedMessage::Legacy(tx_message), &[payer])
+        .expect("Failed to create secp256k1 transaction")
+}
+
+fn build_secp256r1_precompile_transaction(
+    payer: &Keypair,
+    recent_blockhash: Hash,
+) -> VersionedTransaction {
+    let message = b"surfpool secp256r1 precompile check";
+    let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)
+        .expect("failed to create secp256r1 curve group");
+    let signing_key = EcKey::generate(&group).expect("failed to generate secp256r1 key");
+    let signature = sign_secp256r1_message(
+        message,
+        &signing_key
+            .private_key_to_der()
+            .expect("failed to serialize secp256r1 private key"),
+    )
+    .expect("failed to sign secp256r1 message");
+    let mut ctx = BigNumContext::new().expect("failed to create OpenSSL context");
+    let public_key: [u8; 33] = signing_key
+        .public_key()
+        .to_bytes(&group, PointConversionForm::COMPRESSED, &mut ctx)
+        .expect("failed to serialize secp256r1 public key")
+        .try_into()
+        .expect("valid compressed secp256r1 public key");
+    let secp256r1_ix = new_secp256r1_instruction_with_signature(message, &signature, &public_key);
+    let tx_message =
+        Message::new_with_blockhash(&[secp256r1_ix], Some(&payer.pubkey()), &recent_blockhash);
+
+    VersionedTransaction::try_new(VersionedMessage::Legacy(tx_message), &[payer])
+        .expect("Failed to create secp256r1 transaction")
+}
+
+async fn assert_precompile_transaction_succeeds<F>(
+    test_type: TestType,
+    precompile_name: &str,
+    build_tx: F,
+) where
+    F: FnOnce(&Keypair, Hash) -> VersionedTransaction,
+{
+    let payer = Keypair::new();
+    let (mut svm_instance, _simnet_events_rx, _geyser_events_rx) = test_type.initialize_svm();
+    svm_instance
+        .airdrop(&payer.pubkey(), LAMPORTS_PER_SOL)
+        .unwrap()
+        .unwrap();
+    let recent_blockhash = svm_instance.latest_blockhash();
+    let tx = build_tx(&payer, recent_blockhash);
+    let svm_locker = SurfnetSvmLocker::new(svm_instance);
+    let simulation_res = svm_locker.simulate_transaction(tx.clone(), true);
+
+    if let Err(err) = simulation_res {
+        panic!(
+            "Expected {precompile_name} transaction simulation to succeed, got {:?}",
+            err.err
+        );
+    }
+
+    let (status_tx, status_rx) = unbounded();
+    let _ = svm_locker
+        .process_transaction(&None, tx, status_tx, true, true)
+        .await
+        .unwrap();
+
+    match status_rx.recv() {
+        Ok(TransactionStatusEvent::Success(_)) => {}
+        Ok(TransactionStatusEvent::SimulationFailure((error, _))) => {
+            panic!("{precompile_name} transaction simulation failed: {error:?}");
+        }
+        Ok(TransactionStatusEvent::ExecutionFailure((error, _))) => {
+            panic!("{precompile_name} transaction execution failed: {error:?}");
+        }
+        Ok(TransactionStatusEvent::VerificationFailure(error)) => {
+            panic!("{precompile_name} transaction verification failed: {error}");
+        }
+        Err(e) => {
+            panic!("Failed to receive {precompile_name} transaction status: {e:?}");
+        }
+    }
+}
+
+#[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+#[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+#[test_case(TestType::no_db(); "with no db")]
+#[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_transaction_with_secp256k1_instruction(test_type: TestType) {
+    assert_precompile_transaction_succeeds(
+        test_type,
+        "secp256k1",
+        build_secp256k1_precompile_transaction,
+    )
+    .await;
+}
+
+#[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+#[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+#[test_case(TestType::no_db(); "with no db")]
+#[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_transaction_with_secp256r1_instruction(test_type: TestType) {
+    assert_precompile_transaction_succeeds(
+        test_type,
+        "secp256r1",
+        build_secp256r1_precompile_transaction,
+    )
+    .await;
+}
+
+async fn assert_rpc_precompile_simulation_succeeds<F>(precompile_name: &str, build_tx: F)
+where
+    F: FnOnce(&Keypair, Hash) -> VersionedTransaction,
+{
+    use crate::{
+        rpc::full::{Full, SurfpoolFullRpc},
+        tests::helpers::TestSetup,
+    };
+
+    let payer = Keypair::new();
+    let setup = TestSetup::new(SurfpoolFullRpc);
+    setup
+        .rpc
+        .request_airdrop(
+            Some(setup.context.clone()),
+            payer.pubkey().to_string(),
+            LAMPORTS_PER_SOL,
+            None,
+        )
+        .expect("failed to airdrop test payer");
+    let recent_blockhash = setup
+        .context
+        .svm_locker
+        .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+    let tx = build_tx(&payer, recent_blockhash);
+    let simulation_res = setup
+        .rpc
+        .simulate_transaction(
+            Some(setup.context),
+            bs58::encode(bincode::serialize(&tx).expect("failed to serialize transaction"))
+                .into_string(),
+            Some(RpcSimulateTransactionConfig {
+                sig_verify: true,
+                replace_recent_blockhash: false,
+                commitment: Some(CommitmentConfig::confirmed()),
+                encoding: None,
+                accounts: None,
+                min_context_slot: None,
+                inner_instructions: false,
+            }),
+        )
+        .await
+        .expect("simulateTransaction RPC failed");
+
+    assert_eq!(
+        simulation_res.value.err, None,
+        "{precompile_name} simulateTransaction returned an unexpected error"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_rpc_simulate_transaction_with_secp256k1_instruction() {
+    assert_rpc_precompile_simulation_succeeds("secp256k1", build_secp256k1_precompile_transaction)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_rpc_simulate_transaction_with_secp256r1_instruction() {
+    assert_rpc_precompile_simulation_succeeds("secp256r1", build_secp256r1_precompile_transaction)
+        .await;
 }
 
 #[test_case(TestType::sqlite(); "with on-disk sqlite db")]

@@ -107,9 +107,13 @@ axum = { version = "0.8", default-features = false, features = ["tokio", "http1"
 
 [dev-dependencies]
 ed25519-dalek = "1.0.1"
+libsecp256k1 = "0.7.2"
+openssl = "0.10"
 test-case = { workspace = true }
 env_logger = "0.11"
 solana-ed25519-program = { workspace = true }
+solana-secp256k1-program = { version = "3.0", default-features = false, features = ["bincode"] }
+solana-secp256r1-program = "3.0"
 tempfile = { workspace = true }
 spl-token-metadata-interface = { workspace = true }
 

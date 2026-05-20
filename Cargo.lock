@@ -9879,11 +9879,14 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8efa767b0188f577edae7080e8bf080e5db9458e2b6ee5beaa73e2e6bb54e99d"
 dependencies = [
+ "bincode",
  "digest 0.10.7",
  "k256",
  "serde",
  "serde_derive",
  "sha3",
+ "solana-instruction 3.4.0",
+ "solana-sdk-ids 3.1.0",
  "solana-signature",
 ]
 
@@ -11435,9 +11438,11 @@ dependencies = [
  "jsonrpc-ws-server",
  "lazy_static",
  "libloading 0.7.4",
+ "libsecp256k1 0.7.2",
  "litesvm",
  "litesvm-token",
  "log 0.4.29",
+ "openssl",
  "opentelemetry 0.28.0",
  "opentelemetry-prometheus",
  "opentelemetry_sdk 0.28.0",
@@ -11475,6 +11480,8 @@ dependencies = [
  "solana-rpc-client-api",
  "solana-runtime",
  "solana-sdk-ids 3.1.0",
+ "solana-secp256k1-program",
+ "solana-secp256r1-program",
  "solana-signature",
  "solana-signer",
  "solana-slot-hashes 3.0.0",

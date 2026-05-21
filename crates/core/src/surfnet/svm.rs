@@ -425,6 +425,17 @@ fn compose_feature_set(config: &SvmFeatureConfig) -> FeatureSet {
     feature_set
 }
 
+fn synthetic_chain_tip_at_index(index: u64) -> BlockIdentifier {
+    if index == 0 {
+        return BlockIdentifier::zero();
+    }
+
+    BlockIdentifier {
+        index,
+        hash: SyntheticBlockhash::new(index - 1).to_string(),
+    }
+}
+
 impl SurfnetSvm {
     pub fn default() -> (Self, Receiver<SimnetEvent>, Receiver<GeyserEvent>) {
         Self::new(SurfnetSvmConfig::default()).unwrap()
@@ -908,10 +919,7 @@ impl SurfnetSvm {
                 (Some(checkpoint), Some((block_slot, block))) => {
                     if checkpoint > block_slot {
                         (
-                            BlockIdentifier {
-                                index: checkpoint,
-                                hash: SyntheticBlockhash::new(checkpoint).to_string(),
-                            },
+                            synthetic_chain_tip_at_index(checkpoint),
                             checkpoint,
                             checkpoint,
                         )
@@ -927,10 +935,7 @@ impl SurfnetSvm {
                     }
                 }
                 (Some(checkpoint), None) => (
-                    BlockIdentifier {
-                        index: checkpoint,
-                        hash: SyntheticBlockhash::new(checkpoint).to_string(),
-                    },
+                    synthetic_chain_tip_at_index(checkpoint),
                     checkpoint,
                     checkpoint,
                 ),
@@ -960,6 +965,13 @@ impl SurfnetSvm {
         // Initialize transactions_processed from database count for persistent storage
         let transactions_processed = transactions_db.count()?;
         let updated_at = Utc::now().timestamp_millis() as u64;
+        let last_checkpoint_slot = checkpoint_slot.unwrap_or_else(|| {
+            if has_persisted_chain_state {
+                recovered_slot
+            } else {
+                0
+            }
+        });
 
         let mut svm = Self {
             inner,
@@ -1015,7 +1027,7 @@ impl SurfnetSvm {
             genesis_slot: default_genesis_slot,
             genesis_updated_at: updated_at,
             slot_checkpoint: slot_checkpoint_db,
-            last_checkpoint_slot: checkpoint_slot.unwrap_or(0),
+            last_checkpoint_slot,
         };
 
         svm.inner.set_log_bytes_limit(config.log_bytes_limit);
@@ -4602,29 +4614,97 @@ mod tests {
             surfnet_id,
             ..SurfnetSvmConfig::default()
         };
-        let checkpoint_slot = (*CHECKPOINT_INTERVAL_SLOTS).max(FINALIZATION_SLOT_THRESHOLD);
+        let target_slot = (*CHECKPOINT_INTERVAL_SLOTS).max(FINALIZATION_SLOT_THRESHOLD);
+
+        let checkpoint_slot = {
+            let (mut svm, _events_rx, _geyser_rx) =
+                SurfnetSvm::new_with_db(Some(database_url), config.clone()).unwrap();
+            while svm.get_latest_absolute_slot() <= target_slot {
+                svm.confirm_current_block().unwrap();
+            }
+
+            let checkpoint_slot = svm
+                .slot_checkpoint
+                .get(&"latest_slot".to_string())
+                .unwrap()
+                .expect("checkpoint slot should be persisted");
+            svm.shutdown();
+            checkpoint_slot
+        };
+
+        let (mut svm, _events_rx, _geyser_rx) =
+            SurfnetSvm::new_with_db(Some(database_url), config).unwrap();
+        assert_eq!(svm.get_latest_absolute_slot(), checkpoint_slot);
+        assert_eq!(svm.latest_epoch_info.block_height, checkpoint_slot);
+        assert_eq!(svm.chain_tip.index, checkpoint_slot);
+        assert_eq!(
+            svm.chain_tip.hash,
+            SyntheticBlockhash::new(checkpoint_slot - 1).to_string()
+        );
+
+        let clock = svm.inner.get_sysvar::<Clock>();
+        assert_eq!(clock.slot, checkpoint_slot);
+
+        let recovered_blockhash = svm.chain_tip.hash.clone();
+        svm.confirm_current_block().unwrap();
+        assert_eq!(
+            svm.chain_tip.hash,
+            SyntheticBlockhash::new(checkpoint_slot).to_string()
+        );
+        assert_ne!(svm.chain_tip.hash, recovered_blockhash);
+    }
+
+    #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+    #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+    fn test_new_with_db_restores_last_checkpoint_slot_from_block_only_recovery(
+        test_type: TestType,
+    ) {
+        let (database_url, surfnet_id) = match &test_type {
+            TestType::OnDiskSqlite(db_path) => {
+                (db_path.as_str(), "block-only-recovery".to_string())
+            }
+            #[cfg(feature = "postgres")]
+            TestType::Postgres { url, surfnet_id } => (url.as_str(), surfnet_id.clone()),
+            _ => unreachable!("test case must provide persistent database storage"),
+        };
+        let config = SurfnetSvmConfig {
+            surfnet_id,
+            ..SurfnetSvmConfig::default()
+        };
+        let block_slot = (*CHECKPOINT_INTERVAL_SLOTS)
+            .max(FINALIZATION_SLOT_THRESHOLD)
+            .saturating_add(7);
 
         {
             let (mut svm, _events_rx, _geyser_rx) =
                 SurfnetSvm::new_with_db(Some(database_url), config.clone()).unwrap();
-            while svm.get_latest_absolute_slot() <= checkpoint_slot {
-                svm.confirm_current_block().unwrap();
-            }
-
-            assert_eq!(
-                svm.slot_checkpoint.get(&"latest_slot".to_string()).unwrap(),
-                Some(checkpoint_slot)
+            svm.blocks
+                .store(
+                    block_slot,
+                    BlockHeader {
+                        hash: SyntheticBlockhash::new(block_slot - 1).to_string(),
+                        previous_blockhash: SyntheticBlockhash::new(block_slot - 2).to_string(),
+                        parent_slot: block_slot - 1,
+                        block_time: 0,
+                        block_height: block_slot,
+                        signatures: vec![Signature::new_unique()],
+                    },
+                )
+                .unwrap();
+            assert!(
+                svm.slot_checkpoint
+                    .get(&"latest_slot".to_string())
+                    .unwrap()
+                    .is_none()
             );
             svm.shutdown();
         }
 
         let (svm, _events_rx, _geyser_rx) =
             SurfnetSvm::new_with_db(Some(database_url), config).unwrap();
-        assert_eq!(svm.get_latest_absolute_slot(), checkpoint_slot);
-        assert_eq!(svm.latest_epoch_info.block_height, checkpoint_slot);
-
-        let clock = svm.inner.get_sysvar::<Clock>();
-        assert_eq!(clock.slot, checkpoint_slot);
+        assert_eq!(svm.get_latest_absolute_slot(), block_slot);
+        assert_eq!(svm.latest_epoch_info.block_height, block_slot);
+        assert_eq!(svm.last_checkpoint_slot, block_slot);
     }
 
     #[test]

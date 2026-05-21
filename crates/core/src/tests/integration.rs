@@ -7532,6 +7532,46 @@ async fn test_token2022_pausable_mint(test_type: TestType) {
         "Pausable mint should report a paused state after pause"
     );
 
+    let post_pause_transfer_amount = 25_000u64;
+    let post_pause_transfer_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let post_pause_transfer_ix = transfer_checked(
+        &spl_token_2022_interface::id(),
+        &fixture.payer_ata,
+        &fixture.mint.pubkey(),
+        &fixture.recipient_ata,
+        &fixture.payer.pubkey(),
+        &[&fixture.payer.pubkey()],
+        post_pause_transfer_amount,
+        fixture.decimals,
+    )
+    .unwrap();
+    let post_pause_transfer_msg = Message::new_with_blockhash(
+        &[post_pause_transfer_ix],
+        Some(&fixture.payer.pubkey()),
+        &post_pause_transfer_blockhash,
+    );
+    let post_pause_transfer_tx = VersionedTransaction::try_new(
+        VersionedMessage::Legacy(post_pause_transfer_msg),
+        &[&fixture.payer],
+    )
+    .unwrap();
+    let post_pause_transfer_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(post_pause_transfer_tx, false, false));
+    assert!(
+        post_pause_transfer_result.is_err(),
+        "Transfers while paused should fail"
+    );
+    assert_eq!(
+        token_2022_account_balance(&svm_locker, &fixture.payer_ata),
+        fixture.initial_mint_amount - transfer_amount,
+        "Payer ATA balance should remain unchanged when transfers are paused"
+    );
+    assert_eq!(
+        token_2022_account_balance(&svm_locker, &fixture.recipient_ata),
+        transfer_amount,
+        "Recipient ATA balance should remain unchanged when transfers are paused"
+    );
+
     let post_pause_mint_amount = 50_000u64;
     let post_pause_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
     let post_pause_mint_ix = mint_to(

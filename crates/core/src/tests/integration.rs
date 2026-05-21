@@ -35,6 +35,12 @@ use solana_system_interface::{
     instruction as system_instruction, instruction::transfer, program as system_program,
 };
 use solana_transaction::{Transaction, versioned::VersionedTransaction};
+use spl_token_2022_interface::{
+    extension::{
+        BaseStateWithExtensions, ExtensionType, StateWithExtensions, pausable::PausableConfig,
+    },
+    pod::PodMint,
+};
 use surfpool_types::{
     CheatcodeConfig, CheatcodeControlConfig, CheatcodeFilter, DEFAULT_SLOT_TIME_MS, Idl,
     RpcProfileDepth, RpcProfileResultConfig, SimnetCommand, SimnetEvent, SurfpoolConfig,
@@ -7264,6 +7270,300 @@ async fn test_ws_logs_subscribe_logs_content(test_type: TestType) {
     for (i, log) in logs_response.logs.iter().enumerate() {
         println!("  Log {}: {}", i + 1, log);
     }
+}
+
+struct Token2022PausableFixture {
+    payer: Keypair,
+    mint: Keypair,
+    payer_ata: Pubkey,
+    recipient_ata: Pubkey,
+    decimals: u8,
+    initial_mint_amount: u64,
+}
+
+fn token_2022_account_balance(svm_locker: &SurfnetSvmLocker, token_account: &Pubkey) -> u64 {
+    let account = svm_locker
+        .get_account_local(token_account)
+        .inner
+        .map_account()
+        .expect("token account should exist");
+    let token_account_state =
+        StateWithExtensions::<spl_token_2022_interface::state::Account>::unpack(&account.data)
+            .expect("token-2022 account should unpack");
+    token_account_state.base.amount
+}
+
+fn token_2022_mint_is_paused(svm_locker: &SurfnetSvmLocker, mint: &Pubkey) -> bool {
+    let account = svm_locker
+        .get_account_local(mint)
+        .inner
+        .map_account()
+        .expect("mint account should exist");
+    let mint_state =
+        StateWithExtensions::<spl_token_2022_interface::state::Mint>::unpack(&account.data)
+            .expect("token-2022 mint should unpack");
+    let pausable_config = mint_state
+        .get_extension::<PausableConfig>()
+        .expect("mint should have PausableConfig");
+    bool::from(pausable_config.paused)
+}
+
+fn setup_token2022_pausable_fixture(svm_locker: &SurfnetSvmLocker) -> Token2022PausableFixture {
+    use spl_token_2022_interface::{
+        extension::pausable::instruction as pausable_instruction,
+        instruction::{initialize_mint2, mint_to},
+    };
+
+    let payer = Keypair::new();
+    let recipient = Keypair::new();
+    let mint = Keypair::new();
+    let decimals = 6u8;
+    let initial_mint_amount = 1_000_000u64;
+
+    svm_locker
+        .airdrop(&payer.pubkey(), 10 * LAMPORTS_PER_SOL)
+        .unwrap()
+        .unwrap();
+    svm_locker
+        .airdrop(&recipient.pubkey(), LAMPORTS_PER_SOL)
+        .unwrap()
+        .unwrap();
+
+    let mint_space =
+        ExtensionType::try_calculate_account_len::<PodMint>(&[ExtensionType::Pausable])
+            .expect("pausable mint size should calculate");
+    let mint_rent =
+        svm_locker.with_svm_reader(|svm| svm.inner.minimum_balance_for_rent_exemption(mint_space));
+    let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+
+    let payer_ata =
+        spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(
+            &payer.pubkey(),
+            &mint.pubkey(),
+            &spl_token_2022_interface::id(),
+        );
+    let recipient_ata =
+        spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(
+            &recipient.pubkey(),
+            &mint.pubkey(),
+            &spl_token_2022_interface::id(),
+        );
+
+    let create_mint_ix = system_instruction::create_account(
+        &payer.pubkey(),
+        &mint.pubkey(),
+        mint_rent,
+        mint_space as u64,
+        &spl_token_2022_interface::id(),
+    );
+    let init_pausable_ix = pausable_instruction::initialize(
+        &spl_token_2022_interface::id(),
+        &mint.pubkey(),
+        &payer.pubkey(),
+    )
+    .expect("pausable extension should initialize");
+    let init_mint_ix = initialize_mint2(
+        &spl_token_2022_interface::id(),
+        &mint.pubkey(),
+        &payer.pubkey(),
+        Some(&payer.pubkey()),
+        decimals,
+    )
+    .unwrap();
+
+    let create_mint_msg = Message::new_with_blockhash(
+        &[create_mint_ix, init_pausable_ix, init_mint_ix],
+        Some(&payer.pubkey()),
+        &recent_blockhash,
+    );
+    let create_mint_tx =
+        VersionedTransaction::try_new(VersionedMessage::Legacy(create_mint_msg), &[&payer, &mint])
+            .unwrap();
+    let create_mint_result =
+        svm_locker.with_svm_writer(|svm| svm.send_transaction(create_mint_tx, false, false));
+    assert!(
+        create_mint_result.is_ok(),
+        "Pausable mint setup failed: {:?}",
+        create_mint_result.err()
+    );
+    assert!(
+        !token_2022_mint_is_paused(svm_locker, &mint.pubkey()),
+        "Pausable mint should start unpaused"
+    );
+
+    let fund_recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let create_payer_ata_ix =
+        spl_associated_token_account_interface::instruction::create_associated_token_account(
+            &payer.pubkey(),
+            &payer.pubkey(),
+            &mint.pubkey(),
+            &spl_token_2022_interface::id(),
+        );
+    let create_recipient_ata_ix =
+        spl_associated_token_account_interface::instruction::create_associated_token_account(
+            &payer.pubkey(),
+            &recipient.pubkey(),
+            &mint.pubkey(),
+            &spl_token_2022_interface::id(),
+        );
+    let mint_to_ix = mint_to(
+        &spl_token_2022_interface::id(),
+        &mint.pubkey(),
+        &payer_ata,
+        &payer.pubkey(),
+        &[&payer.pubkey()],
+        initial_mint_amount,
+    )
+    .unwrap();
+
+    let fund_msg = Message::new_with_blockhash(
+        &[create_payer_ata_ix, create_recipient_ata_ix, mint_to_ix],
+        Some(&payer.pubkey()),
+        &fund_recent_blockhash,
+    );
+    let fund_tx =
+        VersionedTransaction::try_new(VersionedMessage::Legacy(fund_msg), &[&payer]).unwrap();
+    let fund_result = svm_locker.with_svm_writer(|svm| svm.send_transaction(fund_tx, false, false));
+    assert!(
+        fund_result.is_ok(),
+        "Pausable mint funding failed: {:?}",
+        fund_result.err()
+    );
+    assert_eq!(
+        token_2022_account_balance(svm_locker, &payer_ata),
+        initial_mint_amount,
+        "Payer ATA should hold the initial minted balance"
+    );
+    assert_eq!(
+        token_2022_account_balance(svm_locker, &recipient_ata),
+        0,
+        "Recipient ATA should start empty"
+    );
+
+    Token2022PausableFixture {
+        payer,
+        mint,
+        payer_ata,
+        recipient_ata,
+        decimals,
+        initial_mint_amount,
+    }
+}
+
+/// Token-2022 pausable lifecycle:
+/// create pausable mint → mint → transfer → pause → reject future minting
+#[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+#[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+#[test_case(TestType::no_db(); "with no db")]
+#[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_token2022_pausable_mint(test_type: TestType) {
+    use spl_token_2022_interface::{
+        extension::pausable::instruction as pausable_instruction,
+        instruction::{mint_to, transfer_checked},
+    };
+
+    let (svm_instance, _simnet_events_rx, _geyser_events_rx) = test_type.initialize_svm();
+    let svm_locker = SurfnetSvmLocker::new(svm_instance);
+
+    let fixture = setup_token2022_pausable_fixture(&svm_locker);
+
+    let transfer_amount = 250_000u64;
+    let transfer_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let transfer_ix = transfer_checked(
+        &spl_token_2022_interface::id(),
+        &fixture.payer_ata,
+        &fixture.mint.pubkey(),
+        &fixture.recipient_ata,
+        &fixture.payer.pubkey(),
+        &[&fixture.payer.pubkey()],
+        transfer_amount,
+        fixture.decimals,
+    )
+    .unwrap();
+    let transfer_msg = Message::new_with_blockhash(
+        &[transfer_ix],
+        Some(&fixture.payer.pubkey()),
+        &transfer_blockhash,
+    );
+    let transfer_tx =
+        VersionedTransaction::try_new(VersionedMessage::Legacy(transfer_msg), &[&fixture.payer])
+            .unwrap();
+    let transfer_result =
+        svm_locker.with_svm_writer(|svm| svm.send_transaction(transfer_tx, false, false));
+    assert!(
+        transfer_result.is_ok(),
+        "Transfer before pause failed: {:?}",
+        transfer_result.err()
+    );
+    assert_eq!(
+        token_2022_account_balance(&svm_locker, &fixture.payer_ata),
+        fixture.initial_mint_amount - transfer_amount,
+        "Payer ATA should be debited by the transfer amount"
+    );
+    assert_eq!(
+        token_2022_account_balance(&svm_locker, &fixture.recipient_ata),
+        transfer_amount,
+        "Recipient ATA should receive the transferred tokens"
+    );
+
+    let pause_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let pause_ix = pausable_instruction::pause(
+        &spl_token_2022_interface::id(),
+        &fixture.mint.pubkey(),
+        &fixture.payer.pubkey(),
+        &[&fixture.payer.pubkey()],
+    )
+    .unwrap();
+    let pause_msg =
+        Message::new_with_blockhash(&[pause_ix], Some(&fixture.payer.pubkey()), &pause_blockhash);
+    let pause_tx =
+        VersionedTransaction::try_new(VersionedMessage::Legacy(pause_msg), &[&fixture.payer])
+            .unwrap();
+    let pause_result =
+        svm_locker.with_svm_writer(|svm| svm.send_transaction(pause_tx, false, false));
+    assert!(
+        pause_result.is_ok(),
+        "Pause instruction failed: {:?}",
+        pause_result.err()
+    );
+    assert!(
+        token_2022_mint_is_paused(&svm_locker, &fixture.mint.pubkey()),
+        "Pausable mint should report a paused state after pause"
+    );
+
+    let post_pause_mint_amount = 50_000u64;
+    let post_pause_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let post_pause_mint_ix = mint_to(
+        &spl_token_2022_interface::id(),
+        &fixture.mint.pubkey(),
+        &fixture.recipient_ata,
+        &fixture.payer.pubkey(),
+        &[&fixture.payer.pubkey()],
+        post_pause_mint_amount,
+    )
+    .unwrap();
+    let post_pause_mint_msg = Message::new_with_blockhash(
+        &[post_pause_mint_ix],
+        Some(&fixture.payer.pubkey()),
+        &post_pause_blockhash,
+    );
+    let post_pause_mint_tx = VersionedTransaction::try_new(
+        VersionedMessage::Legacy(post_pause_mint_msg),
+        &[&fixture.payer],
+    )
+    .unwrap();
+    let post_pause_mint_result =
+        svm_locker.with_svm_writer(|svm| svm.send_transaction(post_pause_mint_tx, false, false));
+    assert!(
+        post_pause_mint_result.is_err(),
+        "Minting while paused should fail"
+    );
+    assert_eq!(
+        token_2022_account_balance(&svm_locker, &fixture.recipient_ata),
+        transfer_amount,
+        "Recipient ATA balance should remain unchanged when minting is paused"
+    );
 }
 
 /// Token-2022 lifecycle:

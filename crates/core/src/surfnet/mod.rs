@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::Display};
+use std::{collections::HashMap, fmt::Display, sync::Arc};
 
 use crossbeam_channel::Sender;
 use jsonrpc_core::Result as RpcError;
@@ -14,6 +14,7 @@ use solana_clock::Slot;
 use solana_commitment_config::CommitmentLevel;
 use solana_epoch_info::EpochInfo;
 use solana_pubkey::Pubkey;
+use solana_rpc_client_api::response::SlotUpdate;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::TransactionError;
@@ -177,6 +178,15 @@ pub type LogsSubscriptionData = (
 );
 
 pub type SnapshotSubscriptionData = Sender<SnapshotImportNotification>;
+
+/// Subscription channel for `slotsUpdatesSubscribe` notifications.
+///
+/// Each subscribed client gets one `Sender<Arc<SlotUpdate>>`; the SVM fans
+/// out tagged slot-lifecycle updates (`createdBank`, `frozen`,
+/// `optimisticConfirmation`, `root`) to every active sender. Updates are
+/// wrapped in `Arc` so we only allocate the payload once per emission and
+/// share it across all subscribers.
+pub type SlotsUpdatesSubscriptionData = Sender<Arc<SlotUpdate>>;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotImportNotification {

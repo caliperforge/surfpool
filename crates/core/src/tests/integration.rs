@@ -32,7 +32,7 @@ use solana_message::{
     v0::{self, MessageAddressTableLookup},
 };
 use solana_pubkey::Pubkey;
-use solana_rpc_client_api::response::Response as RpcResponse;
+use solana_rpc_client_api::response::{Response as RpcResponse, SlotUpdate};
 use solana_secp256k1_program::{
     eth_address_from_pubkey, new_secp256k1_instruction_with_signature,
     sign_message as sign_secp256k1_message,
@@ -6964,6 +6964,207 @@ async fn test_ws_slot_subscribe_multiple_slot_changes(test_type: TestType) {
             i + 1,
             slot_info.slot
         );
+    }
+}
+
+#[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+#[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+#[test_case(TestType::no_db(); "with no db")]
+#[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ws_slots_updates_subscribe_basic(test_type: TestType) {
+    use surfpool_types::types::BlockProductionMode;
+
+    let (svm_locker, _simnet_commands_tx, _simnet_events_rx) =
+        boot_simnet(BlockProductionMode::Clock, Some(100), test_type);
+
+    // subscribe to slots updates
+    let slots_updates_rx = svm_locker.subscribe_for_slots_updates();
+
+    // wait for the first slots update event
+    let event_1 = slots_updates_rx.recv_timeout(Duration::from_secs(2));
+    assert!(event_1.is_ok(), "Should receive slots update event");
+
+    let first_event = event_1.unwrap();
+    println!("✓ Received first slots update event: {:?}", first_event);
+
+    // wait for at least one more event to confirm streaming
+    let event_2 = slots_updates_rx.recv_timeout(Duration::from_secs(2));
+    assert!(
+        event_2.is_ok(),
+        "Should receive a second slots update event"
+    );
+
+    println!("✓ slots_updates stream is producing events");
+}
+
+#[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+#[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+#[test_case(TestType::no_db(); "with no db")]
+#[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ws_slots_updates_subscribe_manual_advancement(test_type: TestType) {
+    let (svm_instance, _simnet_events_rx, _geyser_events_rx) = test_type.initialize_svm();
+    let svm_locker = SurfnetSvmLocker::new(svm_instance);
+
+    // subscribe to slots updates
+    let slots_updates_rx = svm_locker.subscribe_for_slots_updates();
+
+    // manually advance slot by confirming a block
+    svm_locker.confirm_current_block(&None).await.unwrap();
+
+    // Drain all events emitted for this single block confirmation and assert we
+    // observe the per-block lifecycle variants. `Root` is intentionally NOT
+    // asserted here: the rooted slot only catches up to `genesis_slot` after
+    // ~FINALIZATION_SLOT_THRESHOLD advancements, so a single confirmation is
+    // not expected to produce a `Root` event. See the
+    // `_root_emission` test below for that coverage.
+    let mut saw_created_bank = false;
+    let mut saw_frozen = false;
+    let mut saw_optimistic_confirmation = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+
+    while std::time::Instant::now() < deadline {
+        let Ok(event) = slots_updates_rx.recv_timeout(Duration::from_millis(200)) else {
+            // No more events arriving in this window; bail out and check what we collected.
+            break;
+        };
+        match event.as_ref() {
+            SlotUpdate::CreatedBank { .. } => saw_created_bank = true,
+            SlotUpdate::Frozen { .. } => saw_frozen = true,
+            SlotUpdate::OptimisticConfirmation { .. } => saw_optimistic_confirmation = true,
+            _ => {}
+        }
+        if saw_created_bank && saw_frozen && saw_optimistic_confirmation {
+            break;
+        }
+    }
+
+    assert!(
+        saw_created_bank,
+        "Should observe CreatedBank slot update event"
+    );
+    assert!(saw_frozen, "Should observe Frozen slot update event");
+    assert!(
+        saw_optimistic_confirmation,
+        "Should observe OptimisticConfirmation slot update event"
+    );
+
+    println!("✓ Observed CreatedBank, Frozen, and OptimisticConfirmation events");
+}
+
+#[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+#[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+#[test_case(TestType::no_db(); "with no db")]
+#[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ws_slots_updates_subscribe_root_emission(test_type: TestType) {
+    use crate::surfnet::FINALIZATION_SLOT_THRESHOLD;
+
+    let (svm_instance, _simnet_events_rx, _geyser_events_rx) = test_type.initialize_svm();
+    let svm_locker = SurfnetSvmLocker::new(svm_instance);
+
+    // Subscribe before advancing so we capture every event from genesis forward.
+    let slots_updates_rx = svm_locker.subscribe_for_slots_updates();
+
+    // Advance enough slots for the rooted slot to catch up to `genesis_slot`,
+    // which is what gates emission of `SlotUpdate::Root`.
+    let advancements = (FINALIZATION_SLOT_THRESHOLD as usize) + 2;
+    for _ in 0..advancements {
+        svm_locker.confirm_current_block(&None).await.unwrap();
+    }
+
+    // Drain everything that's been queued and check for a Root variant.
+    let mut saw_root = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let Ok(event) = slots_updates_rx.recv_timeout(Duration::from_millis(200)) else {
+            break;
+        };
+        if matches!(event.as_ref(), SlotUpdate::Root { .. }) {
+            saw_root = true;
+            break;
+        }
+    }
+
+    assert!(
+        saw_root,
+        "Should observe Root slot update event after {} advancements",
+        advancements
+    );
+    println!(
+        "✓ Observed Root slot update event after {} advancements",
+        advancements
+    );
+}
+
+#[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+#[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+#[test_case(TestType::no_db(); "with no db")]
+#[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ws_slots_updates_subscribe_multiple_subscribers(test_type: TestType) {
+    let (svm_instance, _simnet_events_rx, _geyser_events_rx) = test_type.initialize_svm();
+    let svm_locker = SurfnetSvmLocker::new(svm_instance);
+
+    // create multiple subscriptions
+    let rx1 = svm_locker.subscribe_for_slots_updates();
+    let rx2 = svm_locker.subscribe_for_slots_updates();
+    let rx3 = svm_locker.subscribe_for_slots_updates();
+
+    // advance slot
+    svm_locker.confirm_current_block(&None).await.unwrap();
+
+    // all subscribers should receive at least one slots update event
+    assert!(
+        rx1.recv_timeout(Duration::from_secs(5)).is_ok(),
+        "Subscriber 1 should receive a slots update event"
+    );
+    assert!(
+        rx2.recv_timeout(Duration::from_secs(5)).is_ok(),
+        "Subscriber 2 should receive a slots update event"
+    );
+    assert!(
+        rx3.recv_timeout(Duration::from_secs(5)).is_ok(),
+        "Subscriber 3 should receive a slots update event"
+    );
+
+    println!("✓ All 3 subscribers received slots update events");
+}
+
+#[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+#[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+#[test_case(TestType::no_db(); "with no db")]
+#[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ws_slots_updates_subscribe_multiple_slot_changes(test_type: TestType) {
+    let (svm_instance, _simnet_events_rx, _geyser_events_rx) = test_type.initialize_svm();
+    let svm_locker = SurfnetSvmLocker::new(svm_instance);
+
+    let slots_updates_rx = svm_locker.subscribe_for_slots_updates();
+
+    // advance slot multiple times and ensure each block produces events
+    for i in 0..3 {
+        svm_locker.confirm_current_block(&None).await.unwrap();
+
+        // expect at least one event for this block confirmation
+        let event = slots_updates_rx.recv_timeout(Duration::from_secs(5));
+        assert!(
+            event.is_ok(),
+            "Should receive slots update event for advancement {}",
+            i + 1
+        );
+        println!(
+            "✓ Received slots update event #{}: {:?}",
+            i + 1,
+            event.unwrap()
+        );
+
+        // drain any further events emitted for this block before the next iteration
+        while slots_updates_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_ok()
+        {}
     }
 }
 

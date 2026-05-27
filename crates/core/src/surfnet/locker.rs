@@ -42,7 +42,7 @@ use solana_message::{
     v0::{LoadedAddresses, MessageAddressTableLookup},
 };
 use solana_pubkey::Pubkey;
-use solana_rpc_client_api::response::SlotInfo;
+use solana_rpc_client_api::response::{SlotInfo, SlotUpdate};
 use solana_signature::Signature;
 use solana_transaction::{sanitized::SanitizedTransaction, versioned::VersionedTransaction};
 use solana_transaction_error::TransactionError;
@@ -3436,6 +3436,12 @@ impl SurfnetSvmLocker {
     /// Subscribes for slot updates and returns a receiver of slot updates.
     pub fn subscribe_for_slot_updates(&self) -> Receiver<SlotInfo> {
         self.with_svm_writer(|svm_writer| svm_writer.subscribe_for_slot_updates())
+    }
+
+    /// Subscribes for tagged `slotsUpdatesSubscribe` notifications and
+    /// returns a receiver of shared `SlotUpdate` events.
+    pub fn subscribe_for_slots_updates(&self) -> Receiver<Arc<SlotUpdate>> {
+        self.with_svm_writer(|svm_writer| svm_writer.subscribe_for_slots_updates())
     }
 
     /// Subscribes for logs updates and returns a receiver of logs updates.

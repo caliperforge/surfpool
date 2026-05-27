@@ -2,6 +2,7 @@ use std::{
     cmp::max,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     str::FromStr,
+    sync::Arc,
     time::SystemTime,
 };
 
@@ -40,7 +41,7 @@ use solana_message::{
 };
 use solana_program_option::COption;
 use solana_pubkey::Pubkey;
-use solana_rpc_client_api::response::SlotInfo;
+use solana_rpc_client_api::response::{SlotInfo, SlotTransactionStats, SlotUpdate};
 use solana_sdk_ids::{bpf_loader, system_program};
 use solana_signature::Signature;
 use solana_system_interface::instruction as system_instruction;
@@ -76,7 +77,7 @@ use super::{
     AccountSubscriptionData, BlockHeader, BlockIdentifier, FINALIZATION_SLOT_THRESHOLD,
     GetAccountResult, GeyserBlockMetadata, GeyserEntryInfo, GeyserEvent, GeyserSlotStatus,
     ProgramSubscriptionData, SignatureSubscriptionData, SignatureSubscriptionType,
-    remote::SurfnetRemoteClient,
+    SlotsUpdatesSubscriptionData, remote::SurfnetRemoteClient,
 };
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
@@ -274,6 +275,10 @@ pub struct SurfnetSvm {
     pub account_subscriptions: AccountSubscriptionData,
     pub program_subscriptions: ProgramSubscriptionData,
     pub slot_subscriptions: Vec<Sender<SlotInfo>>,
+    /// Senders fed by [`Self::subscribe_for_slots_updates`]. Each sender
+    /// delivers tagged `SlotUpdate` events (the wire format consumed by
+    /// `slotsUpdatesSubscribe` clients).
+    pub slots_updates_subscriptions: Vec<SlotsUpdatesSubscriptionData>,
     pub profile_tag_map: Box<dyn Storage<String, Vec<UuidOrSignature>>>,
     pub simulated_transaction_profiles: Box<dyn Storage<String, KeyedProfileResult>>,
     pub executed_transaction_profiles: Box<dyn Storage<String, KeyedProfileResult>>,
@@ -482,14 +487,13 @@ impl SurfnetSvm {
     /// This allows profiling transactions without affecting the underlying database.
     /// All storage writes are buffered in memory and discarded when the clone is dropped.
     ///
-    /// Subscription registries (`signature_subscriptions`, `account_subscriptions`,
-    /// `program_subscriptions`, `slot_subscriptions`, `logs_subscriptions`,
-    /// `snapshot_subscriptions`) are all replaced with empty containers on the sandbox so that
-    /// any notification dispatched during sandbox execution cannot reach live WebSocket clients.
-    /// Although `HashMap::clone()` of the original maps is a deep copy of the container, each
-    /// contained `crossbeam_channel::Sender` is a handle to the same channel held by live
-    /// subscriber receivers — re-firing them from the sandbox would leak notifications even on
-    /// bundle abort. Emptying the containers closes that leak.
+    /// Subscription registries (`signature_subscriptions`, `account_subscriptions`, etc)
+    /// are all replaced with empty containers on the sandbox so that any notification
+    /// dispatched during sandbox execution cannot reach live WebSocket clients. Although
+    /// `HashMap::clone()` of the original maps is a deep copy of the container, each contained
+    /// `crossbeam_channel::Sender` is a handle to the same channel held by live subscriber
+    /// receivers — re-firing them from the sandbox would leak notifications even on bundle
+    /// abort. Emptying the containers closes that leak.
     ///
     /// Event channels (`simnet_events_tx`, `geyser_events_tx`) are replaced with internal
     /// buffered channels whose receivers are kept on the sandbox under `sandbox_simnet_events_rx`
@@ -542,12 +546,13 @@ impl SurfnetSvm {
             signature_subscriptions: HashMap::new(),
             account_subscriptions: HashMap::new(),
             program_subscriptions: HashMap::new(),
-            // All six subscription containers are emptied on the sandbox so that no notification
+            // All subscription containers are emptied on the sandbox so that no notification
             // dispatched during sandbox execution can reach live WebSocket subscribers. The three
             // map-based containers above contain `crossbeam_channel::Sender` handles whose
             // `clone()` produces a producer for the same underlying channel held by the live
             // subscriber's receiver — emptying the map is what actually prevents the leak.
             slot_subscriptions: Vec::new(),
+            slots_updates_subscriptions: Vec::new(),
             logs_subscriptions: Vec::new(),
             snapshot_subscriptions: Vec::new(),
 
@@ -991,6 +996,7 @@ impl SurfnetSvm {
             account_subscriptions: HashMap::new(),
             program_subscriptions: HashMap::new(),
             slot_subscriptions: Vec::new(),
+            slots_updates_subscriptions: Vec::new(),
             profile_tag_map: profile_tag_map_db,
             simulated_transaction_profiles: simulated_transaction_profiles_db,
             executed_transaction_profiles: executed_transaction_profiles_db,
@@ -2029,15 +2035,23 @@ impl SurfnetSvm {
     /// Confirms transactions queued for confirmation, updates epoch/slot, and sends events.
     ///
     /// # Returns
-    /// `Ok(Vec<Signature>)` with confirmed signatures, or `Err(SurfpoolError)` on error.
-    fn confirm_transactions(&mut self) -> Result<Vec<Signature>, SurfpoolError> {
+    /// `Ok((Vec<Signature>, u64))` with confirmed signatures and the number
+    /// of transactions whose execution returned an error, or
+    /// `Err(SurfpoolError)` on error. The failure count powers the `stats`
+    /// field of `SlotUpdate::Frozen` notifications emitted to
+    /// `slotsUpdatesSubscribe` clients.
+    fn confirm_transactions(&mut self) -> Result<(Vec<Signature>, u64), SurfpoolError> {
         let mut confirmed_transactions = vec![];
+        let mut num_failed: u64 = 0;
         let slot = self.latest_epoch_info.slot_index;
         let current_slot = self.latest_epoch_info.absolute_slot;
 
         while let Some((tx, status_tx, error)) =
             self.transactions_queued_for_confirmation.pop_front()
         {
+            if error.is_some() {
+                num_failed = num_failed.saturating_add(1);
+            }
             let _ = status_tx.try_send(TransactionStatusEvent::Success(
                 TransactionConfirmationStatus::Confirmed,
             ));
@@ -2081,7 +2095,7 @@ impl SurfnetSvm {
             confirmed_transactions.push(signature);
         }
 
-        Ok(confirmed_transactions)
+        Ok((confirmed_transactions, num_failed))
     }
 
     /// Finalizes transactions queued for finalization, sending finalized events as needed.
@@ -2261,6 +2275,11 @@ impl SurfnetSvm {
 
     pub fn confirm_current_block(&mut self) -> SurfpoolResult<()> {
         let slot = self.get_latest_absolute_slot();
+        // `slotsUpdatesSubscribe` clients expect millisecond-precision Unix
+        // timestamps regardless of the simulator's slot_time, so we anchor
+        // every variant emitted from this function to a single wall-clock
+        // sample. See https://solana.com/docs/rpc/websocket/slotsupdatessubscribe
+        let slots_update_ts: u64 = Utc::now().timestamp_millis().max(0) as u64;
         let previous_chain_tip = self.chain_tip.clone();
         if slot % *GARBAGE_COLLECTION_INTERVAL_SLOTS == 0 {
             debug!("Clearing liteSVM cache at slot {}", slot);
@@ -2268,9 +2287,10 @@ impl SurfnetSvm {
         }
         self.chain_tip = self.new_blockhash();
         // Confirm processed transactions
-        let confirmed_signatures = self.confirm_transactions()?;
+        let (confirmed_signatures, num_failed_transactions) = self.confirm_transactions()?;
 
         let num_transactions = confirmed_signatures.len() as u64;
+        let num_successful_transactions = num_transactions.saturating_sub(num_failed_transactions);
         self.updated_at += self.slot_time;
 
         // Only store blocks that have transactions (sparse block storage)
@@ -2323,6 +2343,31 @@ impl SurfnetSvm {
         let root = new_slot.saturating_sub(FINALIZATION_SLOT_THRESHOLD);
         self.notify_slot_subscribers(new_slot, parent_slot, root);
 
+        // Emit `slotsUpdatesNotification` events for the lifecycle transition
+        // we just completed:
+        //   * `Frozen`     – the slot that was just closed (`slot`) is now
+        //                    immutable; surface its execution stats.
+        //   * `CreatedBank`– the next slot (`new_slot`) has just been opened
+        //                    on top of `parent_slot` (= the freshly-frozen slot).
+        // Surfpool's execution model has no gossip layer, so the
+        // `FirstShredReceived` / `Completed` / `Dead` variants documented by
+        // Solana are intentionally not produced here.
+        self.notify_slots_updates_subscribers(SlotUpdate::Frozen {
+            slot,
+            timestamp: slots_update_ts,
+            stats: SlotTransactionStats {
+                num_transaction_entries: 1,
+                num_successful_transactions,
+                num_failed_transactions,
+                max_transactions_per_entry: num_transactions,
+            },
+        });
+        self.notify_slots_updates_subscribers(SlotUpdate::CreatedBank {
+            slot: new_slot,
+            parent: parent_slot,
+            timestamp: slots_update_ts,
+        });
+
         let geyser_parent_slot = slot.saturating_sub(1);
 
         // Emit confirmation for the same slot used by processed account/transaction updates.
@@ -2333,6 +2378,12 @@ impl SurfnetSvm {
                 status: GeyserSlotStatus::Confirmed,
             })
             .ok();
+        // Mirror the Confirmed Geyser event as an `OptimisticConfirmation`
+        // notification for `slotsUpdatesSubscribe` clients.
+        self.notify_slots_updates_subscribers(SlotUpdate::OptimisticConfirmation {
+            slot,
+            timestamp: slots_update_ts,
+        });
 
         // Notify geyser plugins of block metadata
         let block_metadata = GeyserBlockMetadata {
@@ -2390,6 +2441,12 @@ impl SurfnetSvm {
                     status: GeyserSlotStatus::Rooted,
                 })
                 .ok();
+            // Mirror the Rooted Geyser event as a `Root` notification for
+            // `slotsUpdatesSubscribe` clients.
+            self.notify_slots_updates_subscribers(SlotUpdate::Root {
+                slot: root,
+                timestamp: slots_update_ts,
+            });
         }
 
         // Evict the accounts marked as streamed from cache to enforce them to be fetched again
@@ -3184,6 +3241,33 @@ impl SurfnetSvm {
     pub fn notify_slot_subscribers(&mut self, slot: Slot, parent: Slot, root: Slot) {
         self.slot_subscriptions
             .retain(|tx| tx.send(SlotInfo { slot, parent, root }).is_ok());
+    }
+
+    /// Registers a new sender for `slotsUpdatesSubscribe` notifications and
+    /// returns the matching receiver.
+    ///
+    /// The returned channel will receive every tagged `SlotUpdate` produced
+    /// by [`Self::notify_slots_updates_subscribers`] until the receiver is
+    /// dropped (at which point the SVM will self-prune the sender on the
+    /// next notification).
+    pub fn subscribe_for_slots_updates(&mut self) -> Receiver<Arc<SlotUpdate>> {
+        let (tx, rx) = unbounded();
+        self.slots_updates_subscriptions.push(tx);
+        rx
+    }
+
+    /// Fan-out a tagged `SlotUpdate` to every active
+    /// `slotsUpdatesSubscribe` subscriber. The update is allocated once and
+    /// shared via `Arc` across all senders. Disconnected receivers cause
+    /// their sender to be pruned, mirroring the cleanup pattern used by
+    /// [`Self::notify_slot_subscribers`].
+    pub fn notify_slots_updates_subscribers(&mut self, update: SlotUpdate) {
+        if self.slots_updates_subscriptions.is_empty() {
+            return;
+        }
+        let arc = Arc::new(update);
+        self.slots_updates_subscriptions
+            .retain(|tx| tx.send(arc.clone()).is_ok());
     }
 
     pub fn write_simulated_profile_result(

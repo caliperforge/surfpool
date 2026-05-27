@@ -22,7 +22,7 @@ use solana_client::{
 };
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_pubkey::Pubkey;
-use solana_rpc_client_api::response::{Response as RpcResponse, SlotInfo};
+use solana_rpc_client_api::response::{Response as RpcResponse, SlotInfo, SlotUpdate};
 use solana_signature::Signature;
 use solana_transaction_status::{TransactionConfirmationStatus, UiTransactionEncoding};
 
@@ -750,6 +750,87 @@ pub trait Rpc {
         subscription: SubscriptionId,
     ) -> Result<bool>;
 
+    /// Subscribe to tagged slot lifecycle notifications via WebSocket.
+    ///
+    /// This method streams [`SlotUpdate`] notifications produced by the
+    /// underlying surfnet SVM whenever a slot advances through its
+    /// lifecycle. The notification payload follows Solana's reference
+    /// [`slotsUpdatesSubscribe`](https://solana.com/docs/rpc/websocket/slotsupdatessubscribe)
+    /// wire format: a tagged enum serialized with `type` discriminator and
+    /// camelCase variants (e.g. `"createdBank"`, `"frozen"`,
+    /// `"optimisticConfirmation"`, `"root"`).
+    ///
+    /// ## Parameters
+    /// - `meta`: WebSocket metadata containing RPC context and connection information.
+    /// - `subscriber`: The subscription sink for sending slot update notifications to the client.
+    ///
+    /// ## Returns
+    /// This method does not return a value directly. Instead, it establishes a continuous WebSocket
+    /// subscription that streams `SlotUpdate` notifications to the subscriber whenever the slot
+    /// advances through its lifecycle.
+    ///
+    /// ## Variants Emitted by Surfpool
+    /// - `createdBank` – emitted when the simulator opens a new slot.
+    /// - `frozen` – emitted once the previous slot has been confirmed,
+    ///   carrying execution `stats`.
+    /// - `optimisticConfirmation` – emitted alongside Geyser's `Confirmed`
+    ///   slot-status update for the freshly confirmed slot.
+    /// - `root` – emitted alongside Geyser's `Rooted` slot-status update.
+    ///
+    /// Surfpool has no gossip/shred layer, so the `firstShredReceived`,
+    /// `completed`, and `dead` variants documented in the Solana reference
+    /// are not produced by this implementation.
+    ///
+    /// ## Example WebSocket Request
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "id": 1,
+    ///   "method": "slotsUpdatesSubscribe"
+    /// }
+    /// ```
+    ///
+    /// ## Example WebSocket Response (Subscription Confirmation)
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "result": 0,
+    ///   "id": 1
+    /// }
+    /// ```
+    ///
+    /// ## Example WebSocket Notification (`frozen` variant)
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "method": "slotsUpdatesNotification",
+    ///   "params": {
+    ///     "result": {
+    ///       "type": "frozen",
+    ///       "slot": 356,
+    ///       "timestamp": 1774643712834,
+    ///       "stats": {
+    ///         "numTransactionEntries": 1,
+    ///         "numSuccessfulTransactions": 1,
+    ///         "numFailedTransactions": 0,
+    ///         "maxTransactionsPerEntry": 1
+    ///       }
+    ///     },
+    ///     "subscription": 4
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// ## Notes
+    /// - The subscription remains active until explicitly unsubscribed or the connection is closed.
+    /// - Notifications are delivered without an `RpcResponse` wrapper – the
+    ///   tagged `SlotUpdate` value appears directly under `params.result`.
+    /// - The `timestamp` field is a wall-clock millisecond Unix timestamp.
+    /// - Each subscription runs in its own async task for optimal performance.
+    ///
+    /// ## See Also
+    /// - [`slotsUpdatesUnsubscribe`]: Remove an active subscription
+    /// - [`slotSubscribe`]: Subscribe to the simpler `SlotInfo` stream
     #[pubsub(
         subscription = "slotsUpdatesNotification",
         subscribe,
@@ -758,9 +839,46 @@ pub trait Rpc {
     fn slots_updates_subscribe(
         &self,
         meta: Self::Metadata,
-        subscriber: Subscriber<RpcResponse<()>>,
+        subscriber: Subscriber<Arc<SlotUpdate>>,
     );
 
+    /// Unsubscribe from tagged slot lifecycle notifications.
+    ///
+    /// This method removes an active `slotsUpdatesSubscribe` subscription,
+    /// stopping further notifications for the specified subscription ID. The
+    /// background monitoring task will detect the removal and terminate
+    /// gracefully.
+    ///
+    /// ## Parameters
+    /// - `meta`: Optional WebSocket metadata containing connection information.
+    /// - `subscription`: The subscription ID to remove, as returned by `slotsUpdatesSubscribe`.
+    ///
+    /// ## Returns
+    /// A `Result<bool>` indicating whether the unsubscription was successful:
+    /// - `Ok(true)` if the subscription was successfully removed
+    /// - `Err(Error)` with `InternalError` if the subscription map lock could not be acquired
+    ///
+    /// ## Example WebSocket Request
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "id": 1,
+    ///   "method": "slotsUpdatesUnsubscribe",
+    ///   "params": [0]
+    /// }
+    /// ```
+    ///
+    /// ## Example WebSocket Response
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "result": true,
+    ///   "id": 1
+    /// }
+    /// ```
+    ///
+    /// ## See Also
+    /// - `slotsUpdatesSubscribe`: Create a slots-updates subscription.
     #[pubsub(
         subscription = "slotsUpdatesNotification",
         unsubscribe,
@@ -936,7 +1054,11 @@ pub trait Rpc {
 /// - `uid`: Atomic counter for generating unique subscription IDs across all subscription types.
 /// - `signature_subscription_map`: Thread-safe HashMap containing active signature subscriptions, mapping subscription IDs to their notification sinks.
 /// - `account_subscription_map`: Thread-safe HashMap containing active account subscriptions, mapping subscription IDs to their notification sinks.
+/// - `program_subscription_map`: Thread-safe HashMap containing active program subscriptions, mapping subscription IDs to their notification sinks.
 /// - `slot_subscription_map`: Thread-safe HashMap containing active slot subscriptions, mapping subscription IDs to their notification sinks.
+/// - `slots_updates_subscription_map`: Thread-safe HashMap containing active fine-grained slot-lifecycle subscriptions (`slotsUpdatesSubscribe`), mapping subscription IDs to their `SlotUpdate` notification sinks.
+/// - `logs_subscription_map`: Thread-safe HashMap containing active logs subscriptions, mapping subscription IDs to their notification sinks.
+/// - `snapshot_subscription_map`: Thread-safe HashMap containing active snapshot-import subscriptions, mapping subscription IDs to their notification sinks.
 /// - `tokio_handle`: Runtime handle for spawning asynchronous subscription monitoring tasks.
 ///
 /// ## Features
@@ -967,6 +1089,7 @@ pub struct SurfpoolWsRpc {
     pub program_subscription_map:
         Arc<RwLock<HashMap<SubscriptionId, Sink<RpcResponse<RpcKeyedAccount>>>>>,
     pub slot_subscription_map: Arc<RwLock<HashMap<SubscriptionId, Sink<SlotInfo>>>>,
+    pub slots_updates_subscription_map: Arc<RwLock<HashMap<SubscriptionId, Sink<Arc<SlotUpdate>>>>>,
     pub logs_subscription_map:
         Arc<RwLock<HashMap<SubscriptionId, Sink<RpcResponse<RpcLogsResponse>>>>>,
     pub snapshot_subscription_map:
@@ -1774,18 +1897,97 @@ impl Rpc for SurfpoolWsRpc {
     fn slots_updates_subscribe(
         &self,
         meta: Self::Metadata,
-        _subscriber: Subscriber<RpcResponse<()>>,
+        subscriber: Subscriber<Arc<SlotUpdate>>,
     ) {
         let _ = meta
             .as_ref()
-            .map(|m| m.log_warn("Websocket method 'slots_updates_subscribe' is uninmplemented"));
+            .map(|m| m.log_debug("Websocket 'slots_updates_subscribe' connection established"));
+
+        let id = self.uid.fetch_add(1, atomic::Ordering::SeqCst);
+        let sub_id = SubscriptionId::Number(id as u64);
+        let sink = match subscriber.assign_id(sub_id.clone()) {
+            Ok(sink) => sink,
+            Err(e) => {
+                log::error!("Failed to assign subscription ID: {:?}", e);
+                return;
+            }
+        };
+
+        let slots_updates_active = Arc::clone(&self.slots_updates_subscription_map);
+        let meta = meta.clone();
+
+        let svm_locker = match meta.get_svm_locker() {
+            Ok(locker) => locker,
+            Err(e) => {
+                log::error!("Failed to get SVM locker for slots updates subscription: {e}");
+                if let Err(e) = sink.notify(Err(e.into())) {
+                    log::error!(
+                        "Failed to send error notification to client for SVM locker failure: {e}"
+                    );
+                }
+                return;
+            }
+        };
+
+        self.tokio_handle.spawn(async move {
+            if let Ok(mut guard) = slots_updates_active.write() {
+                guard.insert(sub_id.clone(), sink);
+            } else {
+                log::error!("Failed to acquire write lock on slots_updates_subscription_map");
+                return;
+            }
+
+            let rx = svm_locker.subscribe_for_slots_updates();
+
+            loop {
+                // if the subscription has been removed, break the loop
+                if let Ok(guard) = slots_updates_active.read() {
+                    if guard.get(&sub_id).is_none() {
+                        break;
+                    }
+                } else {
+                    log::error!("Failed to acquire read lock on slots_updates_subscription_map");
+                    break;
+                }
+
+                let Ok(slot_update) = rx.try_recv() else {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    continue;
+                };
+
+                let Ok(guard) = slots_updates_active.read() else {
+                    log::error!("Failed to acquire read lock on slots_updates_subscription_map");
+                    break;
+                };
+
+                let Some(sink) = guard.get(&sub_id) else {
+                    log::error!("Failed to get sink for subscription ID");
+                    break;
+                };
+
+                if let Err(e) = sink.notify(Ok(slot_update)) {
+                    log::error!("Failed to notify client about slots update event: {e}");
+                    break;
+                }
+            }
+        });
     }
 
     fn slots_updates_unsubscribe(
         &self,
         _meta: Option<Self::Metadata>,
-        _subscription: SubscriptionId,
+        subscription: SubscriptionId,
     ) -> Result<bool> {
+        if let Ok(mut guard) = self.slots_updates_subscription_map.write() {
+            guard.remove(&subscription);
+        } else {
+            log::error!("Failed to acquire write lock on slots_updates_subscription_map");
+            return Err(Error {
+                code: ErrorCode::InternalError,
+                message: "Internal error.".into(),
+                data: None,
+            });
+        };
         Ok(true)
     }
 

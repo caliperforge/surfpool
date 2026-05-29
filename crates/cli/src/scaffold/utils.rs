@@ -25,7 +25,7 @@ pub fn get_program_metadata_from_manifest_with_dep(
     let program_name = manifest
         .lib
         .as_ref()
-        .map(|lib| lib.name.clone())
+        .and_then(|lib| lib.name.clone())
         .unwrap_or_else(|| package.name.replace('-', "_"));
 
     let so_exists = {
@@ -89,7 +89,7 @@ pub struct Package {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Lib {
-    pub name: String,
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -205,6 +205,26 @@ solana-program = "1"
 
         assert_eq!(metadata.name, "awesome_app_v2_core");
         assert_ne!(metadata.name, "awesome_app_v_2_core");
+        assert!(metadata.so_exists);
+    }
+
+    #[test]
+    fn manifest_program_name_falls_back_when_lib_has_no_name() {
+        let metadata = manifest_with_program_name(
+            r#"
+[package]
+name = "awesome-app-v2-core"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+solana-program = "1"
+"#,
+        );
+
+        assert_eq!(metadata.name, "awesome_app_v2_core");
         assert!(metadata.so_exists);
     }
 }

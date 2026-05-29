@@ -7,7 +7,6 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
-use convert_case::{Case, Casing};
 use log::debug;
 use serde::{Deserialize, Serialize};
 use txtx_addon_network_svm::templates::{AccountDirEntry, AccountEntry};
@@ -620,12 +619,7 @@ fn deser_programs(
             let cluster: Cluster = cluster.parse()?;
             let programs = programs
                 .iter()
-                .map(|(name, value)| {
-                    Ok((
-                        name.to_case(Case::Snake),
-                        AnchorProgramDeployment::new(value)?,
-                    ))
-                })
+                .map(|(name, value)| Ok((name.clone(), AnchorProgramDeployment::new(value)?)))
                 .collect::<Result<BTreeMap<String, AnchorProgramDeployment>>>()?;
             Ok((cluster, programs))
         })
@@ -637,4 +631,25 @@ pub struct BuildConfig {
     pub verifiable: bool,
     pub solana_version: Option<String>,
     pub docker_image: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anchor_program_names_are_preserved_from_manifest() {
+        let manifest = AnchorManifest::from_manifest_str(
+            r#"
+[programs.localnet]
+awesome_app_v2_core = "11111111111111111111111111111111"
+"#,
+        )
+        .unwrap();
+
+        let programs = manifest.programs.get(&Cluster::Localnet).unwrap();
+
+        assert!(programs.contains_key("awesome_app_v2_core"));
+        assert!(!programs.contains_key("awesome_app_v_2_core"));
+    }
 }

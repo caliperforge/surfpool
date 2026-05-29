@@ -11418,6 +11418,7 @@ dependencies = [
  "surfpool-studio-ui",
  "surfpool-types",
  "tar",
+ "tempfile",
  "tokio",
  "toml 0.8.23",
  "txtx-addon-network-svm",

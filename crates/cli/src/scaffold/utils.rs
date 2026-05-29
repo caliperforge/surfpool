@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Result, anyhow};
-use convert_case::{Case, Casing};
 use serde::Deserialize;
 use txtx_gql::kit::helpers::fs::FileLocation;
 
@@ -19,11 +18,15 @@ pub fn get_program_metadata_from_manifest_with_dep(
         return Ok(None);
     };
 
-    let Some(package) = manifest.package else {
+    let Some(package) = manifest.package.as_ref() else {
         return Ok(None);
     };
 
-    let program_name = package.name.to_case(Case::Snake);
+    let program_name = manifest
+        .lib
+        .as_ref()
+        .map(|lib| lib.name.clone())
+        .unwrap_or_else(|| package.name.replace('-', "_"));
 
     let so_exists = {
         let so_path_str = if let Some(artifacts) = artifacts_path {
@@ -44,6 +47,7 @@ pub fn get_program_metadata_from_manifest_with_dep(
 #[derive(Debug, Clone, Deserialize)]
 pub struct CargoManifestFile {
     pub package: Option<Package>,
+    pub lib: Option<Lib>,
     pub dependencies: Option<BTreeMap<String, Dependency>>,
     pub workspace: Option<Workspace>,
 }
@@ -80,6 +84,11 @@ impl CargoManifestFile {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Package {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Lib {
     pub name: String,
 }
 
@@ -133,4 +142,69 @@ pub struct DependencyDetail {
     pub version: Option<String>,
     pub features: Option<Vec<String>>,
     pub path: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    fn manifest_with_program_name(manifest: &str) -> ProgramMetadata {
+        let temp = tempdir().unwrap();
+        let deploy_dir = temp.path().join("target/deploy");
+        fs::create_dir_all(&deploy_dir).unwrap();
+        fs::write(deploy_dir.join("awesome_app_v2_core.so"), []).unwrap();
+
+        let base_location =
+            FileLocation::from_path_string(temp.path().to_string_lossy().as_ref()).unwrap();
+        let manifest = CargoManifestFile::from_manifest_str(manifest).unwrap();
+
+        get_program_metadata_from_manifest_with_dep(
+            "solana-program",
+            &base_location,
+            &manifest,
+            None,
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn manifest_program_name_prefers_lib_name() {
+        let metadata = manifest_with_program_name(
+            r#"
+[package]
+name = "awesome-app-v2-core"
+
+[lib]
+name = "awesome_app_v2_core"
+
+[dependencies]
+solana-program = "1"
+"#,
+        );
+
+        assert_eq!(metadata.name, "awesome_app_v2_core");
+        assert!(metadata.so_exists);
+    }
+
+    #[test]
+    fn manifest_program_name_falls_back_to_package_name_without_splitting_digits() {
+        let metadata = manifest_with_program_name(
+            r#"
+[package]
+name = "awesome-app-v2-core"
+
+[dependencies]
+solana-program = "1"
+"#,
+        );
+
+        assert_eq!(metadata.name, "awesome_app_v2_core");
+        assert_ne!(metadata.name, "awesome_app_v_2_core");
+        assert!(metadata.so_exists);
+    }
 }

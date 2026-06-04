@@ -118,9 +118,10 @@ pub type SurfpoolContextualizedResult<T> = SurfpoolResult<SvmAccessContext<T>>;
 
 /// Determines the loading priority for accounts during snapshot loading. Accounts with lower
 /// returned values are loaded first. This function prioritizes non-executable accounts owned
-/// by the upgradeable loader (program data accounts), then non-executable accounts, and
-/// finally executable accounts. This ordering helps ensure that program data accounts are loaded
-/// before any dependent accounts or programs are loaded, which would cause an error in LiteSVM.
+/// by the upgradeable loader (program data accounts) first, then all other accounts, and finally
+/// executable BPF-loader-upgradeable program accounts. This ordering ensures that program data
+/// accounts are available before any dependent program accounts are loaded, which would otherwise
+/// cause an error in LiteSVM.
 fn snapshot_load_priority(account: &Account) -> u8 {
     if account.owner != solana_sdk_ids::bpf_loader_upgradeable::id() {
         return 1;

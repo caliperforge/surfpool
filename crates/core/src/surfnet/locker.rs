@@ -116,6 +116,41 @@ impl<T> SvmAccessContext<T> {
 
 pub type SurfpoolContextualizedResult<T> = SurfpoolResult<SvmAccessContext<T>>;
 
+/// Determines the loading priority for accounts during snapshot loading. Accounts with lower
+/// returned values are loaded first. This function prioritizes non-executable accounts owned
+/// by the upgradeable loader (program data accounts), then non-executable accounts, and
+/// finally executable accounts. This ordering helps ensure that program data accounts are loaded
+/// before any dependent accounts or programs are loaded, which would cause an error in LiteSVM.
+fn snapshot_load_priority(account: &Account) -> u8 {
+    if account.owner != solana_sdk_ids::bpf_loader_upgradeable::id() {
+        return 1;
+    }
+
+    let programdata_metadata_size = UpgradeableLoaderState::size_of_programdata_metadata();
+    if !account.executable
+        && account.data.len() >= programdata_metadata_size
+        && matches!(
+            bincode::deserialize::<UpgradeableLoaderState>(
+                &account.data[..programdata_metadata_size]
+            ),
+            Ok(UpgradeableLoaderState::ProgramData { .. })
+        )
+    {
+        return 0;
+    }
+
+    if account.executable
+        && matches!(
+            bincode::deserialize::<UpgradeableLoaderState>(&account.data),
+            Ok(UpgradeableLoaderState::Program { .. })
+        )
+    {
+        return 2;
+    }
+
+    1
+}
+
 /// Helper function to apply an override to a JSON value using dot notation path
 ///
 /// # Arguments
@@ -598,6 +633,8 @@ impl SurfnetSvmLocker {
                 }
             }
         }
+
+        accounts_to_load.sort_by_key(|(_, account)| snapshot_load_priority(account));
 
         // Load all accounts into the SVM
         self.with_svm_writer(|svm| {

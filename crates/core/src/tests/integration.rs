@@ -26,6 +26,7 @@ use solana_ed25519_program::new_ed25519_instruction_with_signature;
 use solana_epoch_info::EpochInfo;
 use solana_epoch_schedule::EpochSchedule;
 use solana_hash::Hash;
+use solana_instruction::{AccountMeta, Instruction};
 use solana_keypair::Keypair;
 use solana_message::{
     AddressLookupTableAccount, Message, MessageHeader, VersionedMessage, legacy,
@@ -50,9 +51,9 @@ use spl_token_2022_interface::{
     pod::PodMint,
 };
 use surfpool_types::{
-    CheatcodeConfig, CheatcodeControlConfig, CheatcodeFilter, DEFAULT_SLOT_TIME_MS, Idl,
-    RpcProfileDepth, RpcProfileResultConfig, SimnetCommand, SimnetEvent, SurfpoolConfig,
-    UiAccountChange, UiAccountProfileState, UiKeyedProfileResult,
+    AccountSnapshot, CheatcodeConfig, CheatcodeControlConfig, CheatcodeFilter,
+    DEFAULT_SLOT_TIME_MS, Idl, RpcProfileDepth, RpcProfileResultConfig, SimnetCommand, SimnetEvent,
+    SurfpoolConfig, UiAccountChange, UiAccountProfileState, UiKeyedProfileResult,
     types::{
         BlockProductionMode, RpcConfig, SimnetConfig, SubgraphConfig, TransactionStatusEvent,
         UuidOrSignature,
@@ -868,6 +869,115 @@ async fn assert_precompile_transaction_succeeds<F>(
             panic!("Failed to receive {precompile_name} transaction status: {e:?}");
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_load_snapshot_program_is_invokable() {
+    let snapshot: std::collections::BTreeMap<String, Option<AccountSnapshot>> =
+        serde_json::from_str(include_str!("assets/program_snapshot.json"))
+            .expect("program snapshot fixture should deserialize");
+    let program_id = Pubkey::from_str_const("11157t3sqMV725NVRLrVQbAu98Jjfk1uCKehJnXXQs");
+    let programdata_address =
+        Pubkey::from_str_const("4rDReLryR2HcKBK5DrRzuf7N8g8BFTyEeoEpWgs17DXb");
+    let payer = Keypair::new();
+
+    let bind_host = "127.0.0.1";
+    let bind_port = get_free_port().unwrap();
+    let ws_port = get_free_port().unwrap();
+    let config = SurfpoolConfig {
+        simnets: vec![SimnetConfig {
+            airdrop_addresses: vec![payer.pubkey()],
+            airdrop_token_amount: LAMPORTS_PER_SOL,
+            block_production_mode: BlockProductionMode::Manual,
+            offline_mode: true,
+            snapshot,
+            ..SimnetConfig::default()
+        }],
+        rpc: RpcConfig {
+            bind_host: bind_host.to_string(),
+            bind_port,
+            ws_port,
+            ..RpcConfig::default()
+        },
+        ..SurfpoolConfig::default()
+    };
+
+    let (surfnet_svm, simnet_events_rx, geyser_events_rx) = TestType::no_db().initialize_svm();
+    let (simnet_commands_tx, simnet_commands_rx) = unbounded();
+    let svm_locker = SurfnetSvmLocker::new(surfnet_svm);
+    let runloop_locker = svm_locker.clone();
+    let _handle = hiro_system_kit::thread_named("test_load_snapshot_program_is_invokable")
+        .spawn(move || {
+            let future = start_local_surfnet_runloop(
+                runloop_locker,
+                config,
+                simnet_commands_tx,
+                simnet_commands_rx,
+                geyser_events_rx,
+            );
+            if let Err(e) = hiro_system_kit::nestable_block_on(future) {
+                panic!("{e:?}");
+            }
+        })
+        .expect("failed to spawn surfnet runloop");
+
+    loop {
+        if matches!(simnet_events_rx.recv(), Ok(SimnetEvent::Ready(_))) {
+            break;
+        }
+    }
+
+    let program_account = svm_locker
+        .with_svm_reader(|svm| svm.get_account(&program_id))
+        .unwrap()
+        .expect("program account should be loaded from snapshot");
+    assert!(
+        program_account.executable,
+        "snapshot program account should be executable"
+    );
+    assert!(
+        svm_locker
+            .with_svm_reader(|svm| svm.get_account(&programdata_address))
+            .unwrap()
+            .is_some(),
+        "programdata account should be loaded from snapshot"
+    );
+
+    let full_client =
+        http::connect::<FullClient>(format!("http://{bind_host}:{bind_port}").as_str())
+            .await
+            .expect("Failed to connect to Surfpool");
+    let recent_blockhash = full_client
+        .get_latest_blockhash(None)
+        .await
+        .map(|r| {
+            Hash::from_str(r.value.blockhash.as_str()).expect("Failed to deserialize blockhash")
+        })
+        .expect("Failed to get blockhash");
+    let invoke_snapshot_program = Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(system_program::id(), false),
+        ],
+        data: vec![0],
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[invoke_snapshot_program],
+        Some(&payer.pubkey()),
+        &[&payer],
+        recent_blockhash,
+    );
+
+    let encoded = bincode::serialize(&VersionedTransaction::from(tx))
+        .map(bs58::encode)
+        .map(|encoded| encoded.into_string())
+        .expect("transaction should serialize");
+    let result = full_client.send_transaction(encoded, None).await;
+    assert!(
+        result.is_ok(),
+        "snapshot-loaded program should be invokable, got {result:?}"
+    );
 }
 
 #[test_case(TestType::sqlite(); "with on-disk sqlite db")]

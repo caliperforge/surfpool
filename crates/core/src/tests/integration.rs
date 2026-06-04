@@ -13,7 +13,10 @@ use p256::ecdsa::{
 };
 use solana_account::Account;
 use solana_account_decoder::{UiAccountData, UiAccountEncoding, parse_account_data::ParsedAccount};
-use solana_address_lookup_table_interface::state::{AddressLookupTable, LookupTableMeta};
+use solana_address_lookup_table_interface::{
+    instruction as address_lookup_table_instruction,
+    state::{AddressLookupTable, LookupTableMeta},
+};
 use solana_client::{
     nonblocking::rpc_client::RpcClient,
     rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig},
@@ -9687,6 +9690,105 @@ async fn test_account_loaded_twice_rejected(test_type: TestType) {
     );
 
     println!("AccountLoadedTwice rejection test passed!");
+}
+
+// ============================================================================
+// Regression #684: finalized slot must be recent enough for ALT creation
+// ============================================================================
+// Address lookup table creation validates the provided recent_slot against the
+// SlotHashes sysvar. Client code commonly passes getSlot(finalized), which
+// should remain inside SlotHashes' 512-entry retention window.
+#[cfg_attr(feature = "ignore_tests_ci", ignore = "flaky CI tests")]
+#[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+#[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+#[test_case(TestType::no_db(); "with no db")]
+#[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_create_lookup_table_with_finalized_slot(test_type: TestType) {
+    use solana_slot_hashes::SlotHashes;
+
+    let (svm_instance, _simnet_events_rx, _geyser_events_rx) = test_type.initialize_svm();
+    let svm_locker = SurfnetSvmLocker::new(svm_instance);
+
+    let payer = Keypair::new();
+    svm_locker
+        .airdrop(&payer.pubkey(), LAMPORTS_PER_SOL)
+        .unwrap()
+        .unwrap();
+
+    while svm_locker.get_latest_absolute_slot() < 40 {
+        svm_locker.confirm_current_block(&None).await.unwrap();
+    }
+
+    let processed_slot = svm_locker.get_slot_for_commitment(&CommitmentConfig::processed());
+    let finalized_slot = svm_locker.get_slot_for_commitment(&CommitmentConfig::finalized());
+
+    assert_eq!(
+        finalized_slot,
+        processed_slot.saturating_sub(FINALIZATION_SLOT_THRESHOLD),
+        "test setup should mirror Surfpool's finalized slot lag"
+    );
+
+    let slot_hash_slots = svm_locker.with_svm_reader(|svm| {
+        svm.inner
+            .get_sysvar::<SlotHashes>()
+            .slot_hashes()
+            .iter()
+            .map(|(slot, _)| *slot)
+            .collect::<Vec<_>>()
+    });
+    assert!(
+        slot_hash_slots.contains(&finalized_slot),
+        "SlotHashes should contain finalized_slot={finalized_slot}; entries={slot_hash_slots:?}"
+    );
+
+    let (create_lookup_table_ix, lookup_table_address) =
+        address_lookup_table_instruction::create_lookup_table(
+            payer.pubkey(),
+            payer.pubkey(),
+            finalized_slot,
+        );
+    let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let message = Message::new_with_blockhash(
+        &[create_lookup_table_ix],
+        Some(&payer.pubkey()),
+        &recent_blockhash,
+    );
+    let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&payer]).unwrap();
+
+    let (status_tx, status_rx) = crossbeam_unbounded();
+    let result = svm_locker
+        .process_transaction(&None, tx, status_tx, false, true)
+        .await;
+    assert!(
+        result.is_ok(),
+        "CreateLookupTable should accept getSlot(finalized) as recent_slot; \
+         processed_slot={processed_slot}, finalized_slot={finalized_slot}, \
+         SlotHashes entries={slot_hash_slots:?}, result={result:?}"
+    );
+
+    match status_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(TransactionStatusEvent::Success(_)) => {}
+        other => panic!(
+            "CreateLookupTable should succeed, got: {other:?}; \
+             processed_slot={processed_slot}, finalized_slot={finalized_slot}, \
+             SlotHashes entries={slot_hash_slots:?}"
+        ),
+    }
+
+    let lookup_table_account = svm_locker
+        .with_svm_reader(|svm| svm.get_account(&lookup_table_address))
+        .unwrap();
+    assert!(
+        matches!(
+            lookup_table_account,
+            Some(Account {
+                owner,
+                ..
+            }) if owner == solana_address_lookup_table_interface::program::id()
+        ),
+        "lookup table account {lookup_table_address} should be created"
+    );
 }
 
 #[cfg_attr(feature = "ignore_tests_ci", ignore = "flaky CI tests")]

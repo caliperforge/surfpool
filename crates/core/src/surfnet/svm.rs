@@ -43,6 +43,7 @@ use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::SlotInfo;
 use solana_sdk_ids::{bpf_loader, system_program};
 use solana_signature::Signature;
+use solana_slot_hashes::MAX_ENTRIES as MAX_SLOT_HASHES_ENTRIES;
 use solana_system_interface::instruction as system_instruction;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::TransactionError;
@@ -434,6 +435,16 @@ fn synthetic_chain_tip_at_index(index: u64) -> BlockIdentifier {
         index,
         hash: SyntheticBlockhash::new(index - 1).to_string(),
     }
+}
+
+fn synthetic_blockhash_for_slot(slot: Slot, genesis_slot: Slot) -> SyntheticBlockhash {
+    if slot >= genesis_slot {
+        return SyntheticBlockhash::new(slot - genesis_slot);
+    }
+
+    // Pre-genesis slot hashes only exist to cover the finalized warmup window.
+    // Keep them deterministic and distinct from local chain-index hashes.
+    SyntheticBlockhash::new(u64::MAX - (genesis_slot - slot - 1))
 }
 
 impl SurfnetSvm {
@@ -1340,12 +1351,30 @@ impl SurfnetSvm {
         let recent_blockhashes = RecentBlockhashes::from_iter(recent_blockhashes_vec);
         self.inner.set_sysvar(&recent_blockhashes);
 
-        // 2. Reconstruct SlotHashes - maps absolute slots to blockhashes
-        let start_absolute_slot = start_index + self.genesis_slot;
+        // 2. Reconstruct SlotHashes - maps absolute slots to blockhashes.
+        // The local ledger starts at genesis_slot, but finalized commitment is
+        // reported as current_slot - FINALIZATION_SLOT_THRESHOLD. During the
+        // initial warmup this points before genesis_slot, so seed those
+        // synthetic slots into SlotHashes while preserving the local hash
+        // mapping for genesis_slot and later.
+        let slot_hash_start_index =
+            current_index.saturating_sub(MAX_SLOT_HASHES_ENTRIES as u64 - 1);
+        let local_start_absolute_slot = slot_hash_start_index + self.genesis_slot;
+        let finalized_start_absolute_slot =
+            current_absolute_slot.saturating_sub(FINALIZATION_SLOT_THRESHOLD);
+        let earliest_retained_slot =
+            current_absolute_slot.saturating_sub(MAX_SLOT_HASHES_ENTRIES as u64 - 1);
+        let start_absolute_slot = local_start_absolute_slot
+            .min(finalized_start_absolute_slot)
+            .max(earliest_retained_slot);
         let slot_hashes_vec: Vec<_> = (start_absolute_slot..=current_absolute_slot)
             .rev()
-            .zip(synthetic_hashes.iter())
-            .map(|(slot, hash)| (slot, *hash.hash()))
+            .map(|slot| {
+                (
+                    slot,
+                    *synthetic_blockhash_for_slot(slot, self.genesis_slot).hash(),
+                )
+            })
             .collect();
         let slot_hashes = SlotHashes::new(&slot_hashes_vec);
         self.inner.set_sysvar(&slot_hashes);
@@ -5332,8 +5361,13 @@ mod tests {
         // Verify SlotHashes sysvar
         let slot_hashes = svm.inner.get_sysvar::<SlotHashes>();
 
-        // Should have 6 entries (indices 0 through 5, mapped to slots 100 through 105)
-        assert_eq!(slot_hashes.len(), 6);
+        // Should include the finalized warmup window even though slots 74-99
+        // are before the local genesis slot.
+        assert_eq!(slot_hashes.len(), 32);
+        assert!(
+            slot_hashes.get(&74).is_some(),
+            "SlotHashes should contain the finalized warmup floor"
+        );
 
         // Check that slot 105 maps to hash for index 5
         let expected_hash_105 = SyntheticBlockhash::new(5);
@@ -5353,6 +5387,37 @@ mod tests {
             hash_for_100.unwrap(),
             expected_hash_100.hash(),
             "Hash for slot 100 should match SyntheticBlockhash for index 0"
+        );
+    }
+
+    #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+    #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+    #[test_case(TestType::no_db(); "with no db")]
+    #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+    fn test_reconstruct_sysvars_slot_hashes_cover_finalized_warmup(test_type: TestType) {
+        use solana_slot_hashes::SlotHashes;
+
+        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
+
+        svm.chain_tip = BlockIdentifier::new(9, "test_hash");
+        svm.genesis_slot = FINALIZATION_SLOT_THRESHOLD;
+        svm.latest_epoch_info.absolute_slot = 40;
+
+        svm.reconstruct_sysvars();
+
+        let slot_hashes = svm.inner.get_sysvar::<SlotHashes>();
+
+        assert_eq!(
+            slot_hashes.len(),
+            (FINALIZATION_SLOT_THRESHOLD + 1) as usize
+        );
+        assert!(
+            slot_hashes.get(&9).is_some(),
+            "SlotHashes should include finalized slot 9 during warmup"
+        );
+        assert!(
+            slot_hashes.get(&40).is_some(),
+            "SlotHashes should include the processed slot"
         );
     }
 
@@ -5392,14 +5457,15 @@ mod tests {
     #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
     #[allow(deprecated)]
     fn test_reconstruct_sysvars_max_blockhashes(test_type: TestType) {
+        use solana_slot_hashes::SlotHashes;
         use solana_sysvar::recent_blockhashes::RecentBlockhashes;
 
         let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
 
-        // Set up: chain_tip.index = 200 (more than MAX_RECENT_BLOCKHASHES_STANDARD = 150)
-        svm.chain_tip = BlockIdentifier::new(200, "test_hash");
+        // Set up: chain_tip.index = 600 (more than MAX_RECENT_BLOCKHASHES_STANDARD)
+        svm.chain_tip = BlockIdentifier::new(600, "test_hash");
         svm.genesis_slot = 0;
-        svm.latest_epoch_info.absolute_slot = 200;
+        svm.latest_epoch_info.absolute_slot = 600;
 
         svm.reconstruct_sysvars();
 
@@ -5412,16 +5478,32 @@ mod tests {
             "RecentBlockhashes should be capped at MAX_RECENT_BLOCKHASHES_STANDARD"
         );
 
-        // First entry should still be for chain_tip.index (200)
-        let expected_hash = SyntheticBlockhash::new(200);
+        let slot_hashes = svm.inner.get_sysvar::<SlotHashes>();
+        assert_eq!(
+            slot_hashes.len(),
+            MAX_SLOT_HASHES_ENTRIES,
+            "SlotHashes should be capped at MAX_SLOT_HASHES_ENTRIES"
+        );
+        assert!(
+            slot_hashes.get(&89).is_some(),
+            "SlotHashes should retain the 512-slot floor"
+        );
+        assert!(
+            slot_hashes.get(&88).is_none(),
+            "SlotHashes should evict slots older than the 512-slot floor"
+        );
+
+        // First entry should still be for chain_tip.index (600)
+        let expected_hash = SyntheticBlockhash::new(600);
         assert_eq!(
             recent_blockhashes.first().unwrap().blockhash,
             *expected_hash.hash(),
             "First blockhash should match SyntheticBlockhash for chain_tip.index"
         );
 
-        // Last entry should be for index 51 (200 - 149)
-        let expected_last_hash = SyntheticBlockhash::new(51);
+        // Last RecentBlockhashes entry should use its own cap.
+        let expected_last_hash =
+            SyntheticBlockhash::new(600 - MAX_RECENT_BLOCKHASHES_STANDARD as u64 + 1);
         assert_eq!(
             recent_blockhashes.last().unwrap().blockhash,
             *expected_last_hash.hash(),

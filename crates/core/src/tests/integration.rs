@@ -922,8 +922,15 @@ async fn test_load_snapshot_program_is_invokable() {
         .expect("failed to spawn surfnet runloop");
 
     loop {
-        if matches!(simnet_events_rx.recv(), Ok(SimnetEvent::Ready(_))) {
-            break;
+        match simnet_events_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(SimnetEvent::Ready(_)) => break,
+            Ok(_) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                panic!("timed out waiting for surfnet runloop to become ready");
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                panic!("surfnet runloop exited before becoming ready");
+            }
         }
     }
 

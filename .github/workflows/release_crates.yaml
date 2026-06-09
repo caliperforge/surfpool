@@ -17,8 +17,94 @@ on:
         default: false
 
 jobs:
-  publish:
+  prepare_release:
+    name: Prepare Release
     if: github.event.repository.fork == false
+    runs-on: ubuntu-latest
+    outputs:
+      crates: ${{ steps.crates.outputs.crates }}
+      should_publish: ${{ steps.crates.outputs.should_publish }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check publishable crates
+        id: crates
+        env:
+          REQUESTED_CRATES: ${{ inputs.crates }}
+        shell: bash
+        run: |
+          if [ -n "$REQUESTED_CRATES" ]; then
+            CRATES="$REQUESTED_CRATES"
+          else
+            CRATES="surfpool-types surfpool-db surfpool-core surfpool-sdk surfpool-studio-ui"
+          fi
+
+          echo "crates=$CRATES" >> "$GITHUB_OUTPUT"
+          SHOULD_PUBLISH=false
+          METADATA=$(cargo metadata --format-version=1 --no-deps)
+
+          check_crates_io() {
+            local crate="$1"
+            local version="$2"
+            local response_file="$3"
+            local http_status=""
+
+            for attempt in 1 2 3; do
+              if http_status=$(curl -sS \
+                -o "$response_file" \
+                -w "%{http_code}" \
+                -H "User-Agent: surfpool-release-workflow (github.com/solana-foundation/surfpool)" \
+                "https://crates.io/api/v1/crates/$crate/$version"); then
+                if [ "$http_status" = "200" ] || [ "$http_status" = "404" ]; then
+                  echo "$http_status"
+                  return 0
+                fi
+              fi
+
+              if [ "$attempt" -lt 3 ]; then
+                echo "::warning::crates.io check for $crate@$version returned HTTP ${http_status:-000}; retrying" >&2
+                sleep 5
+              fi
+            done
+
+            echo "${http_status:-000}"
+          }
+
+          for CRATE in $CRATES; do
+            VERSION=$(jq -r --arg name "$CRATE" '.packages[] | select(.name == $name) | .version' <<< "$METADATA")
+
+            if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+              echo "::warning::Could not find version for $CRATE, skipping"
+              continue
+            fi
+
+            RESPONSE_FILE=$(mktemp)
+            HTTP_STATUS=$(check_crates_io "$CRATE" "$VERSION" "$RESPONSE_FILE")
+
+            if [ "$HTTP_STATUS" = "200" ] && jq -e '.version' "$RESPONSE_FILE" > /dev/null 2>&1; then
+              echo "$CRATE@$VERSION is already published"
+            elif [ "$HTTP_STATUS" = "404" ]; then
+              echo "$CRATE@$VERSION is ready to publish"
+              SHOULD_PUBLISH=true
+            else
+              echo "::error::Failed to check crates.io for $CRATE@$VERSION (HTTP $HTTP_STATUS)"
+              cat "$RESPONSE_FILE"
+              rm -f "$RESPONSE_FILE"
+              exit 1
+            fi
+
+            rm -f "$RESPONSE_FILE"
+          done
+
+          echo "should_publish=$SHOULD_PUBLISH" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: prepare_release
+    if: github.event.repository.fork == false && needs.prepare_release.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     environment: release
 
@@ -49,13 +135,36 @@ jobs:
       - name: Publish crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          CRATES: ${{ needs.prepare_release.outputs.crates }}
           DRY_RUN: ${{ inputs.dry_run }}
+        shell: bash
         run: |
-          if [ -n "${{ inputs.crates }}" ]; then
-            CRATES="${{ inputs.crates }}"
-          else
-            CRATES="surfpool-types surfpool-db surfpool-core surfpool-sdk surfpool-studio-ui"
-          fi
+          check_crates_io() {
+            local crate="$1"
+            local version="$2"
+            local response_file="$3"
+            local http_status=""
+
+            for attempt in 1 2 3; do
+              if http_status=$(curl -sS \
+                -o "$response_file" \
+                -w "%{http_code}" \
+                -H "User-Agent: surfpool-release-workflow (github.com/solana-foundation/surfpool)" \
+                "https://crates.io/api/v1/crates/$crate/$version"); then
+                if [ "$http_status" = "200" ] || [ "$http_status" = "404" ]; then
+                  echo "$http_status"
+                  return 0
+                fi
+              fi
+
+              if [ "$attempt" -lt 3 ]; then
+                echo "::warning::crates.io check for $crate@$version returned HTTP ${http_status:-000}; retrying" >&2
+                sleep 5
+              fi
+            done
+
+            echo "${http_status:-000}"
+          }
 
           for CRATE in $CRATES; do
             VERSION=$(cargo metadata --format-version=1 --no-deps \
@@ -66,15 +175,21 @@ jobs:
               continue
             fi
 
-            # Check crates.io API to see if crate is already published
-            API_RESPONSE=$(curl -s \
-              -H "User-Agent: surfpool-release-workflow (github.com/solana-foundation/surfpool)" \
-              "https://crates.io/api/v1/crates/$CRATE/$VERSION")
-            if echo "$API_RESPONSE" | jq -e '.version' > /dev/null 2>&1; then
+            RESPONSE_FILE=$(mktemp)
+            HTTP_STATUS=$(check_crates_io "$CRATE" "$VERSION" "$RESPONSE_FILE")
+
+            if [ "$HTTP_STATUS" = "200" ] && jq -e '.version' "$RESPONSE_FILE" > /dev/null 2>&1; then
               echo "$CRATE@$VERSION is already published, skipping"
+              rm -f "$RESPONSE_FILE"
               continue
+            elif [ "$HTTP_STATUS" != "404" ]; then
+              echo "::error::Failed to check crates.io for $CRATE@$VERSION (HTTP $HTTP_STATUS)"
+              cat "$RESPONSE_FILE"
+              rm -f "$RESPONSE_FILE"
+              exit 1
             fi
 
+            rm -f "$RESPONSE_FILE"
             echo "Publishing $CRATE@$VERSION..."
             if [ "$DRY_RUN" = "true" ]; then
               cargo publish --package "$CRATE" --dry-run

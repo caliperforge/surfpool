@@ -3683,9 +3683,7 @@ impl SurfnetSvm {
                 if exclude_sysvars && account.owner == solana_sdk_ids::sysvar::id() {
                     return;
                 }
-                if exclude_feature_gates
-                    && agave_feature_set::FEATURE_NAMES.contains_key(pubkey)
-                {
+                if exclude_feature_gates && agave_feature_set::FEATURE_NAMES.contains_key(pubkey) {
                     return;
                 }
             }
@@ -3844,11 +3842,11 @@ mod tests {
     use solana_transaction::Transaction;
     use solana_transaction_error::TransactionError;
     use spl_token_interface::state::{Account as TokenAccount, AccountState};
+    use surfpool_types::ExportSnapshotFilter;
     use test_case::test_case;
 
     use super::*;
     use crate::storage::tests::TestType;
-    use surfpool_types::ExportSnapshotFilter;
 
     fn build_transfer_transaction(
         payer: &Keypair,

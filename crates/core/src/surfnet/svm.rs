@@ -3660,6 +3660,8 @@ impl SurfnetSvm {
         let include_program_accounts = filter.include_program_accounts.unwrap_or(false);
         let include_accounts = filter.include_accounts.unwrap_or_default();
         let exclude_accounts = filter.exclude_accounts.unwrap_or_default();
+        let exclude_sysvars = filter.exclude_sysvars.unwrap_or(false);
+        let exclude_feature_gates = filter.exclude_feature_gates.unwrap_or(false);
 
         fn is_program_account(pubkey: &Pubkey) -> bool {
             pubkey == &bpf_loader::id()
@@ -3676,6 +3678,16 @@ impl SurfnetSvm {
                 || ((is_program_account && !include_program_accounts) && !is_include_account)
             {
                 return;
+            }
+            if !is_include_account {
+                if exclude_sysvars && account.owner == solana_sdk_ids::sysvar::id() {
+                    return;
+                }
+                if exclude_feature_gates
+                    && agave_feature_set::FEATURE_NAMES.contains_key(pubkey)
+                {
+                    return;
+                }
             }
 
             // For token accounts, we need to provide the mint additional data
@@ -3836,6 +3848,7 @@ mod tests {
 
     use super::*;
     use crate::storage::tests::TestType;
+    use surfpool_types::ExportSnapshotFilter;
 
     fn build_transfer_transaction(
         payer: &Keypair,
@@ -5555,5 +5568,142 @@ mod tests {
         assert_eq!(clock_1.slot, clock_2.slot);
         assert_eq!(clock_1.epoch, clock_2.epoch);
         assert_eq!(clock_1.unix_timestamp, clock_2.unix_timestamp);
+    }
+
+    fn pick_known_feature_gate() -> Pubkey {
+        *agave_feature_set::FEATURE_NAMES
+            .keys()
+            .next()
+            .expect("agave_feature_set::FEATURE_NAMES is non-empty")
+    }
+
+    fn seed_filterable_accounts(svm: &mut SurfnetSvm) -> (Pubkey, Pubkey, Pubkey) {
+        let user_pubkey = Pubkey::new_unique();
+        let user_account = Account {
+            lamports: 1_000_000,
+            data: vec![],
+            owner: system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        };
+        svm.set_account(&user_pubkey, user_account).unwrap();
+
+        let sysvar_pubkey = Pubkey::new_unique();
+        let sysvar_account = Account {
+            lamports: 1,
+            data: vec![1, 2, 3, 4],
+            owner: solana_sdk_ids::sysvar::id(),
+            executable: false,
+            rent_epoch: 0,
+        };
+        svm.set_account(&sysvar_pubkey, sysvar_account).unwrap();
+
+        let feature_pubkey = pick_known_feature_gate();
+        let feature_account = Account {
+            lamports: 1,
+            data: vec![],
+            owner: solana_sdk_ids::feature::id(),
+            executable: false,
+            rent_epoch: 0,
+        };
+        svm.set_account(&feature_pubkey, feature_account).unwrap();
+
+        (user_pubkey, sysvar_pubkey, feature_pubkey)
+    }
+
+    #[test]
+    fn test_export_snapshot_default_includes_sysvars_and_feature_gates() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let (user, sysvar, feature) = seed_filterable_accounts(&mut svm);
+
+        let snapshot = svm
+            .export_snapshot(ExportSnapshotConfig::default())
+            .unwrap();
+
+        assert!(snapshot.contains_key(&user.to_string()));
+        assert!(snapshot.contains_key(&sysvar.to_string()));
+        assert!(snapshot.contains_key(&feature.to_string()));
+    }
+
+    #[test]
+    fn test_export_snapshot_exclude_sysvars() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let (user, sysvar, feature) = seed_filterable_accounts(&mut svm);
+
+        let snapshot = svm
+            .export_snapshot(ExportSnapshotConfig {
+                filter: Some(ExportSnapshotFilter {
+                    exclude_sysvars: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert!(snapshot.contains_key(&user.to_string()));
+        assert!(!snapshot.contains_key(&sysvar.to_string()));
+        assert!(snapshot.contains_key(&feature.to_string()));
+    }
+
+    #[test]
+    fn test_export_snapshot_exclude_feature_gates() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let (user, sysvar, feature) = seed_filterable_accounts(&mut svm);
+
+        let snapshot = svm
+            .export_snapshot(ExportSnapshotConfig {
+                filter: Some(ExportSnapshotFilter {
+                    exclude_feature_gates: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert!(snapshot.contains_key(&user.to_string()));
+        assert!(snapshot.contains_key(&sysvar.to_string()));
+        assert!(!snapshot.contains_key(&feature.to_string()));
+    }
+
+    #[test]
+    fn test_export_snapshot_exclude_sysvars_and_feature_gates() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let (user, sysvar, feature) = seed_filterable_accounts(&mut svm);
+
+        let snapshot = svm
+            .export_snapshot(ExportSnapshotConfig {
+                filter: Some(ExportSnapshotFilter {
+                    exclude_sysvars: Some(true),
+                    exclude_feature_gates: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert!(snapshot.contains_key(&user.to_string()));
+        assert!(!snapshot.contains_key(&sysvar.to_string()));
+        assert!(!snapshot.contains_key(&feature.to_string()));
+    }
+
+    #[test]
+    fn test_export_snapshot_include_accounts_overrides_exclusions() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let (_user, sysvar, feature) = seed_filterable_accounts(&mut svm);
+
+        let snapshot = svm
+            .export_snapshot(ExportSnapshotConfig {
+                filter: Some(ExportSnapshotFilter {
+                    exclude_sysvars: Some(true),
+                    exclude_feature_gates: Some(true),
+                    include_accounts: Some(vec![sysvar.to_string(), feature.to_string()]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert!(snapshot.contains_key(&sysvar.to_string()));
+        assert!(snapshot.contains_key(&feature.to_string()));
     }
 }

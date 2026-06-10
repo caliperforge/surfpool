@@ -1144,6 +1144,13 @@ pub struct ExportSnapshotFilter {
     pub include_program_accounts: Option<bool>,
     pub include_accounts: Option<Vec<String>>,
     pub exclude_accounts: Option<Vec<String>>,
+    /// When true, omit accounts owned by the sysvar program.
+    pub exclude_sysvars: Option<bool>,
+    /// When true, omit accounts whose pubkey is a known agave feature gate
+    /// (as defined by the `agave_feature_set::FEATURE_NAMES` set built into
+    /// this surfpool binary). Feature gates added upstream after this version
+    /// will not be excluded.
+    pub exclude_feature_gates: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

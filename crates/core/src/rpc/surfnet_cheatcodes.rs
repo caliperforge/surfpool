@@ -922,8 +922,10 @@ pub trait SurfnetCheatcodes {
     ///     - `includeParsedAccounts`: If true, includes parsed account data in the snapshot.
     ///     - `filter`: An optional filter config to limit which accounts are included in the snapshot. Fields include:
     ///         - `includeProgramAccounts`: A boolean indicating whether to include program accounts.
-    ///         - `includeAccounts`: A list of specific account public keys to include.
-    ///         - `excludeAccounts`: A list of specific account public keys to exclude.
+    ///         - `includeAccounts`: A list of specific account public keys to include. Pubkeys listed here bypass `excludeSysvars` and `excludeFeatureGates`.
+    ///         - `excludeAccounts`: A list of specific account public keys to exclude. Takes precedence over `includeAccounts`.
+    ///         - `excludeSysvars`: If true, omit accounts owned by the sysvar program.
+    ///         - `excludeFeatureGates`: If true, omit accounts whose pubkey is a known agave feature gate (per the `agave_feature_set::FEATURE_NAMES` set compiled into this binary).
     ///     - `scope`: An optional scope to limit the accounts included in the snapshot. Options include:
     ///         - `network`: Includes all accounts in the network.
     ///         - `preTransaction`: Only includes accounts touched by the given transaction.

@@ -1961,7 +1961,9 @@ impl Rpc for SurfpoolWsRpc {
                 };
 
                 let Some(sink) = guard.get(&sub_id) else {
-                    log::error!("Failed to get sink for subscription ID");
+                    // The subscription was removed by `slots_updates_unsubscribe`
+                    // between the loop-top check and re-acquiring the read lock
+                    // here. This is the normal clean-exit path, not an error.
                     break;
                 };
 

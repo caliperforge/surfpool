@@ -2352,11 +2352,16 @@ impl SurfnetSvm {
         // Surfpool's execution model has no gossip layer, so the
         // `FirstShredReceived` / `Completed` / `Dead` variants documented by
         // Solana are intentionally not produced here.
+        // Surfpool executes transactions sequentially in a single entry per
+        // block, unlike real Solana where a block can contain multiple entries
+        // (parallel execution batches). As a result `max_transactions_per_entry`
+        // equals the total transaction count for the slot.
+        const SURFPOOL_ENTRIES_PER_BLOCK: u64 = 1;
         self.notify_slots_updates_subscribers(SlotUpdate::Frozen {
             slot,
             timestamp: slots_update_ts,
             stats: SlotTransactionStats {
-                num_transaction_entries: 1,
+                num_transaction_entries: SURFPOOL_ENTRIES_PER_BLOCK,
                 num_successful_transactions,
                 num_failed_transactions,
                 max_transactions_per_entry: num_transactions,

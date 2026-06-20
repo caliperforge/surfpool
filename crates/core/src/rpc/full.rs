@@ -1401,6 +1401,7 @@ impl Full for SurfpoolFullRpc {
                         Some(RpcInflationReward {
                             amount: 0,
                             commission: None,
+                            commission_bps: None,
                             effective_slot: svm_reader.get_latest_absolute_slot(),
                             epoch: svm_reader.latest_epoch_info().epoch,
                             post_balance: 0,
@@ -1431,6 +1432,7 @@ impl Full for SurfpoolFullRpc {
 
         Ok(vec![RpcContactInfo {
             pubkey: SURFPOOL_IDENTITY_PUBKEY.to_string(),
+            client_id: None,
             gossip,
             tvu: None,
             tpu,
@@ -3511,7 +3513,8 @@ mod tests {
                     meta: res.transaction.clone().meta, // Using the same values to avoid reintroducing processing logic errors
                     version: Some(version)
                 },
-                block_time: res.block_time // Using the same values to avoid flakyness
+                block_time: res.block_time, // Using the same values to avoid flakyness
+                transaction_index: None,
             }
         );
     }
@@ -4417,6 +4420,7 @@ mod tests {
             cluster_nodes,
             vec![RpcContactInfo {
                 pubkey: SURFPOOL_IDENTITY_PUBKEY.to_string(),
+                client_id: None,
                 gossip: Some("127.0.0.1:8001".parse().unwrap()),
                 tvu: None,
                 tpu: Some("127.0.0.1:8003".parse().unwrap()),
@@ -4777,7 +4781,8 @@ mod tests {
                 effective_slot,
                 amount: 0,
                 post_balance: 0,
-                commission: None
+                commission: None,
+                commission_bps: None,
             })
         )
     }

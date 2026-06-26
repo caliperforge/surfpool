@@ -51,7 +51,6 @@ use crate::{
     surfnet::{
         FINALIZATION_SLOT_THRESHOLD, GetAccountResult, GetTransactionResult,
         locker::{SvmAccessContext, TransactionPreflightError},
-        svm::MAX_RECENT_BLOCKHASHES_STANDARD,
     },
     types::SurfnetTransactionStatus,
 };
@@ -2348,12 +2347,17 @@ impl Full for SurfpoolFullRpc {
             }
         }
 
-        let blockhash = svm_locker
-            .get_latest_blockhash(&commitment)
-            .unwrap_or_else(|| svm_locker.latest_absolute_blockhash());
+        let (blockhash, last_valid_block_height) = svm_locker.with_svm_reader(|svm_reader| {
+            let blockhash = svm_reader
+                .blockhash_for_slot(committed_latest_slot)
+                .filter(|hash| svm_reader.is_recent_blockhash_valid_for_processing(hash))
+                .unwrap_or_else(|| svm_reader.latest_blockhash());
+            let last_valid_block_height = svm_reader
+                .last_valid_block_height_for_hash(&blockhash)
+                .unwrap_or_else(|| svm_reader.latest_epoch_info().block_height);
+            (blockhash, last_valid_block_height)
+        });
 
-        let current_block_height = svm_locker.get_epoch_info().block_height;
-        let last_valid_block_height = current_block_height + MAX_RECENT_BLOCKHASHES_STANDARD as u64;
         Ok(RpcResponse {
             context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
             value: RpcBlockhash {
@@ -2379,8 +2383,9 @@ impl Full for SurfpoolFullRpc {
         let committed_latest_slot =
             svm_locker.get_slot_for_commitment(&config.commitment.unwrap_or_default());
 
-        let is_valid =
-            svm_locker.with_svm_reader(|svm_reader| svm_reader.check_blockhash_is_recent(&hash));
+        let is_valid = svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader.is_recent_blockhash_valid_for_processing(&hash)
+        });
 
         if let Some(min_context_slot) = config.min_context_slot {
             if committed_latest_slot < min_context_slot {

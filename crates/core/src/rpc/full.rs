@@ -2642,17 +2642,20 @@ fn get_simulate_transaction_result(
 mod tests {
     pub const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 
-    use std::thread::JoinHandle;
-
     use base64::{Engine, prelude::BASE64_STANDARD};
     use bincode::Options;
     use crossbeam_channel::Receiver;
+    use solana_account::Account;
     use solana_account_decoder::{UiAccount, UiAccountData, UiAccountEncoding};
     use solana_client::rpc_config::RpcSimulateTransactionAccountsConfig;
+    use solana_clock::MAX_PROCESSING_AGE;
     use solana_commitment_config::CommitmentConfig;
     use solana_hash::Hash;
     use solana_instruction::Instruction;
     use solana_keypair::Keypair;
+    use solana_loader_v3_interface::{
+        instruction as loader_v3_instruction, state::UpgradeableLoaderState,
+    };
     use solana_message::{
         MessageHeader, legacy::Message as LegacyMessage, v0::Message as V0Message,
     };
@@ -2671,7 +2674,7 @@ mod tests {
         EncodedTransaction, EncodedTransactionWithStatusMeta, UiCompiledInstruction, UiMessage,
         UiRawMessage, UiTransaction, UiTransactionEncoding,
     };
-    use surfpool_types::{SimnetCommand, TransactionConfirmationStatus};
+    use surfpool_types::{SimnetCommand, TransactionConfirmationStatus, TransactionStatusEvent};
     use test_case::test_case;
 
     use super::*;
@@ -2711,25 +2714,22 @@ mod tests {
         tx: VersionedTransaction,
         setup: TestSetup<SurfpoolFullRpc>,
         mempool_rx: Receiver<SimnetCommand>,
-    ) -> JoinHandle<String> {
-        let setup_clone = setup.clone();
-        let handle = hiro_system_kit::thread_named("send_tx")
-            .spawn(move || {
-                let res = setup_clone
-                    .rpc
-                    .send_transaction(
-                        Some(setup_clone.context),
-                        bs58::encode(bincode::serialize(&tx).unwrap()).into_string(),
-                        None,
-                    )
-                    .unwrap();
-
-                res
-            })
+    ) -> String {
+        let res = setup
+            .rpc
+            .send_transaction(
+                Some(setup.context.clone()),
+                bs58::encode(bincode::serialize(&tx).unwrap()).into_string(),
+                None,
+            )
+            .await
             .unwrap();
+
         loop {
             match mempool_rx.recv() {
-                Ok(SimnetCommand::ProcessTransaction(_, tx, status_tx, _, _)) => {
+                Ok(SimnetCommand::ProcessTransaction(request)) => {
+                    let tx = request.transaction;
+                    let status_tx = request.status_tx;
                     let mut writer = setup.context.svm_locker.0.write().await;
                     let slot = writer.get_latest_absolute_slot();
                     writer.transactions_queued_for_confirmation.push_back((
@@ -2754,11 +2754,9 @@ mod tests {
                             ),
                         )
                         .unwrap();
-                    status_tx
-                        .send(TransactionStatusEvent::Success(
-                            TransactionConfirmationStatus::Confirmed,
-                        ))
-                        .unwrap();
+                    let _ = status_tx.send(TransactionStatusEvent::Success(
+                        TransactionConfirmationStatus::Confirmed,
+                    ));
                     break;
                 }
                 Ok(SimnetCommand::AirdropProcessed) => continue,
@@ -2766,7 +2764,7 @@ mod tests {
             }
         }
 
-        handle
+        res
     }
 
     #[test_case(None, false ; "when limit is None")]
@@ -3104,12 +3102,347 @@ mod tests {
             .await
             .airdrop(&payer.pubkey(), 2 * LAMPORTS_PER_SOL);
 
-        let handle = send_and_await_transaction(tx.clone(), setup.clone(), mempool_rx).await;
+        let signature = send_and_await_transaction(tx.clone(), setup.clone(), mempool_rx).await;
         assert_eq!(
-            handle.join().unwrap(),
+            signature,
             tx.signatures[0].to_string(),
             "incorrect signature"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_rpc_accepted_transaction_survives_internal_blockhash_expiry() {
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let (mempool_tx, mempool_rx) = crossbeam_channel::unbounded();
+        let setup = TestSetup::new_with_mempool(SurfpoolFullRpc, mempool_tx);
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+
+        let _ = setup
+            .context
+            .svm_locker
+            .0
+            .write()
+            .await
+            .airdrop(&payer.pubkey(), 2 * LAMPORTS_PER_SOL);
+
+        let tx = build_legacy_transaction(
+            &payer.pubkey(),
+            &[&payer.insecure_clone()],
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &recipient,
+                LAMPORTS_PER_SOL,
+            )],
+            &recent_blockhash,
+        );
+
+        let config = SurfpoolRpcSendTransactionConfig {
+            base: RpcSendTransactionConfig {
+                skip_preflight: true,
+                ..Default::default()
+            },
+            skip_sig_verify: None,
+        };
+        let signature = setup
+            .rpc
+            .send_transaction(
+                Some(setup.context.clone()),
+                bs58::encode(bincode::serialize(&tx).unwrap()).into_string(),
+                Some(config),
+            )
+            .await
+            .unwrap();
+        assert_eq!(signature, tx.signatures[0].to_string());
+
+        let request = match mempool_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("expected queued transaction")
+        {
+            SimnetCommand::ProcessTransaction(request) => request,
+            other => panic!("unexpected simnet command: {other:?}"),
+        };
+
+        setup.context.svm_locker.with_svm_writer(|svm_writer| {
+            for _ in 0..=MAX_PROCESSING_AGE {
+                svm_writer.confirm_current_block().unwrap();
+            }
+            assert!(
+                !svm_writer.is_recent_blockhash_valid_for_processing(&recent_blockhash),
+                "test setup should expire the accepted blockhash before execution"
+            );
+        });
+
+        let (status_tx, status_rx) = crossbeam_channel::bounded(1);
+        setup
+            .context
+            .svm_locker
+            .process_transaction_with_blockhash_validation(
+                &None,
+                request.transaction,
+                status_tx,
+                request.skip_preflight,
+                !request.skip_sig_verify.unwrap_or(false),
+                request.blockhash_validation,
+            )
+            .await
+            .unwrap();
+
+        match status_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("expected transaction status")
+        {
+            TransactionStatusEvent::Success(TransactionConfirmationStatus::Processed) => {}
+            TransactionStatusEvent::ExecutionFailure((TransactionError::BlockhashNotFound, _)) => {
+                panic!("accepted transaction failed with BlockhashNotFound during execution")
+            }
+            other => panic!("unexpected transaction status: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_loader_write_batch_survives_internal_blockhash_expiry() {
+        let payer = Keypair::new();
+        let buffer_authority = Keypair::new();
+        let buffer = Keypair::new();
+        let (mempool_tx, mempool_rx) = crossbeam_channel::unbounded();
+        let setup = TestSetup::new_with_mempool(SurfpoolFullRpc, mempool_tx);
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+
+        let batch_len = MAX_PROCESSING_AGE + 10;
+        let chunk_len = 4usize;
+        let program_len = batch_len * chunk_len;
+        let mut buffer_data = bincode::serialize(&UpgradeableLoaderState::Buffer {
+            authority_address: Some(buffer_authority.pubkey()),
+        })
+        .unwrap();
+        buffer_data.resize(UpgradeableLoaderState::size_of_buffer(program_len), 0);
+
+        setup.context.svm_locker.with_svm_writer(|svm_writer| {
+            let _ = svm_writer
+                .airdrop(&payer.pubkey(), 10 * LAMPORTS_PER_SOL)
+                .unwrap();
+            svm_writer
+                .set_account(
+                    &buffer.pubkey(),
+                    Account {
+                        lamports: 10 * LAMPORTS_PER_SOL,
+                        data: buffer_data,
+                        owner: solana_sdk_ids::bpf_loader_upgradeable::id(),
+                        executable: false,
+                        rent_epoch: 0,
+                    },
+                )
+                .unwrap();
+        });
+
+        let config = SurfpoolRpcSendTransactionConfig {
+            base: RpcSendTransactionConfig {
+                skip_preflight: true,
+                ..Default::default()
+            },
+            skip_sig_verify: None,
+        };
+
+        for i in 0..batch_len {
+            let offset = i * chunk_len;
+            let bytes = vec![i as u8; chunk_len];
+            let instruction = loader_v3_instruction::write(
+                &buffer.pubkey(),
+                &buffer_authority.pubkey(),
+                offset as u32,
+                bytes,
+            );
+            let tx = VersionedTransaction::try_new(
+                VersionedMessage::Legacy(LegacyMessage::new_with_blockhash(
+                    &[instruction],
+                    Some(&payer.pubkey()),
+                    &recent_blockhash,
+                )),
+                &[payer.insecure_clone(), buffer_authority.insecure_clone()],
+            )
+            .unwrap();
+            setup
+                .rpc
+                .send_transaction(
+                    Some(setup.context.clone()),
+                    bs58::encode(bincode::serialize(&tx).unwrap()).into_string(),
+                    Some(config.clone()),
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut requests = Vec::with_capacity(batch_len);
+        for _ in 0..batch_len {
+            match mempool_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("expected queued loader write")
+            {
+                SimnetCommand::ProcessTransaction(request) => requests.push(request),
+                other => panic!("unexpected simnet command: {other:?}"),
+            }
+        }
+
+        setup.context.svm_locker.with_svm_writer(|svm_writer| {
+            for _ in 0..=MAX_PROCESSING_AGE {
+                svm_writer.confirm_current_block().unwrap();
+            }
+            assert!(
+                !svm_writer.is_recent_blockhash_valid_for_processing(&recent_blockhash),
+                "test setup should expire the accepted blockhash before execution"
+            );
+        });
+
+        for request in requests {
+            let (status_tx, status_rx) = crossbeam_channel::bounded(1);
+            setup
+                .context
+                .svm_locker
+                .process_transaction_with_blockhash_validation(
+                    &None,
+                    request.transaction,
+                    status_tx,
+                    request.skip_preflight,
+                    !request.skip_sig_verify.unwrap_or(false),
+                    request.blockhash_validation,
+                )
+                .await
+                .unwrap();
+
+            match status_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("expected loader write status")
+            {
+                TransactionStatusEvent::Success(TransactionConfirmationStatus::Processed) => {}
+                TransactionStatusEvent::ExecutionFailure((
+                    TransactionError::BlockhashNotFound,
+                    _,
+                )) => panic!("accepted loader write failed with BlockhashNotFound"),
+                other => panic!("unexpected loader write status: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_send_transaction_rejects_invalid_blockhash_at_admission() {
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let (mempool_tx, mempool_rx) = crossbeam_channel::unbounded();
+        let setup = TestSetup::new_with_mempool(SurfpoolFullRpc, mempool_tx);
+        let invalid_blockhash = Hash::new_unique();
+
+        let _ = setup
+            .context
+            .svm_locker
+            .0
+            .write()
+            .await
+            .airdrop(&payer.pubkey(), 2 * LAMPORTS_PER_SOL);
+
+        let tx = build_legacy_transaction(
+            &payer.pubkey(),
+            &[&payer.insecure_clone()],
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &recipient,
+                LAMPORTS_PER_SOL,
+            )],
+            &invalid_blockhash,
+        );
+
+        let config = SurfpoolRpcSendTransactionConfig {
+            base: RpcSendTransactionConfig {
+                skip_preflight: true,
+                ..Default::default()
+            },
+            skip_sig_verify: None,
+        };
+        let err = setup
+            .rpc
+            .send_transaction(
+                Some(setup.context.clone()),
+                bs58::encode(bincode::serialize(&tx).unwrap()).into_string(),
+                Some(config),
+            )
+            .await
+            .expect_err("invalid blockhash should be rejected before enqueue");
+        assert!(
+            err.message.contains("Blockhash"),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            mempool_rx.try_recv().is_err(),
+            "invalid blockhash transaction should not be enqueued"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_send_transaction_accepts_invalid_blockhash_when_skip_blockhash_check() {
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let (mempool_tx, mempool_rx) = crossbeam_channel::unbounded();
+        let setup = TestSetup::new_with_mempool(SurfpoolFullRpc, mempool_tx);
+        let invalid_blockhash = Hash::new_unique();
+
+        // Operator opted into `--skip-blockhash-check`; admission must honor it.
+        setup
+            .context
+            .svm_locker
+            .with_svm_writer(|svm_writer| svm_writer.skip_blockhash_check = true);
+
+        let _ = setup
+            .context
+            .svm_locker
+            .0
+            .write()
+            .await
+            .airdrop(&payer.pubkey(), 2 * LAMPORTS_PER_SOL);
+
+        let tx = build_legacy_transaction(
+            &payer.pubkey(),
+            &[&payer.insecure_clone()],
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &recipient,
+                LAMPORTS_PER_SOL,
+            )],
+            &invalid_blockhash,
+        );
+
+        let config = SurfpoolRpcSendTransactionConfig {
+            base: RpcSendTransactionConfig {
+                skip_preflight: true,
+                ..Default::default()
+            },
+            skip_sig_verify: None,
+        };
+        let signature = setup
+            .rpc
+            .send_transaction(
+                Some(setup.context.clone()),
+                bs58::encode(bincode::serialize(&tx).unwrap()).into_string(),
+                Some(config),
+            )
+            .await
+            .expect("skip_blockhash_check should bypass the admission blockhash check");
+        assert_eq!(signature, tx.signatures[0].to_string());
+
+        match mempool_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("transaction should be enqueued for execution")
+        {
+            SimnetCommand::ProcessTransaction(request) => {
+                assert_eq!(request.transaction.signatures[0], tx.signatures[0]);
+            }
+            other => panic!("unexpected simnet command: {other:?}"),
+        }
     }
 
     #[test_case(TransactionVersion::Legacy(Legacy::Legacy) ; "Legacy transactions")]
@@ -3670,9 +4003,11 @@ mod tests {
 
         insert_test_blocks(&setup, 100..=150);
 
-        // processed commitment
-        {
-            let commitment = CommitmentConfig::processed();
+        for commitment in [
+            CommitmentConfig::processed(),
+            CommitmentConfig::confirmed(),
+            CommitmentConfig::finalized(),
+        ] {
             let res = setup
                 .rpc
                 .get_latest_blockhash(
@@ -3683,83 +4018,21 @@ mod tests {
                     }),
                 )
                 .unwrap();
-            let expected_blockhash = setup
+            let committed_slot = setup
                 .context
                 .svm_locker
-                .get_latest_blockhash(&commitment)
-                .unwrap();
-
-            let current_block_height = setup.context.svm_locker.get_epoch_info().block_height;
-            let expected_last_valid_block_height =
-                current_block_height + MAX_RECENT_BLOCKHASHES_STANDARD as u64;
-
-            assert_eq!(
-                res.value.blockhash,
-                expected_blockhash.to_string(),
-                "Latest blockhash does not match expected value"
-            );
-            assert_eq!(
-                res.value.last_valid_block_height, expected_last_valid_block_height,
-                "Last valid block height does not match expected value"
-            );
-        }
-
-        // confirmed commitment
-        {
-            let commitment = CommitmentConfig::confirmed();
-            let res = setup
-                .rpc
-                .get_latest_blockhash(
-                    Some(setup.context.clone()),
-                    Some(RpcContextConfig {
-                        commitment: Some(commitment.clone()),
-                        ..Default::default()
-                    }),
-                )
-                .unwrap();
-            let expected_blockhash = setup
-                .context
-                .svm_locker
-                .get_latest_blockhash(&commitment)
-                .unwrap();
-
-            let current_block_height = setup.context.svm_locker.get_epoch_info().block_height;
-            let expected_last_valid_block_height =
-                current_block_height + MAX_RECENT_BLOCKHASHES_STANDARD as u64;
-
-            assert_eq!(
-                res.value.blockhash,
-                expected_blockhash.to_string(),
-                "Latest blockhash does not match expected value"
-            );
-            assert_eq!(
-                res.value.last_valid_block_height, expected_last_valid_block_height,
-                "Last valid block height does not match expected value"
-            );
-        }
-
-        // confirmed finalized
-        {
-            let commitment = CommitmentConfig::finalized();
-            let res = setup
-                .rpc
-                .get_latest_blockhash(
-                    Some(setup.context.clone()),
-                    Some(RpcContextConfig {
-                        commitment: Some(commitment.clone()),
-                        ..Default::default()
-                    }),
-                )
-                .unwrap();
-            let expected_blockhash = setup
-                .context
-                .svm_locker
-                .get_latest_blockhash(&commitment)
-                .unwrap();
-
-            let current_block_height = setup.context.svm_locker.get_epoch_info().block_height;
-            let expected_last_valid_block_height =
-                current_block_height + MAX_RECENT_BLOCKHASHES_STANDARD as u64;
+                .get_slot_for_commitment(&commitment);
+            let (expected_blockhash, expected_last_valid_block_height) =
+                setup.context.svm_locker.with_svm_reader(|svm_reader| {
+                    let expected_blockhash = svm_reader
+                        .blockhash_for_slot(committed_slot)
+                        .filter(|hash| svm_reader.is_recent_blockhash_valid_for_processing(hash))
+                        .unwrap_or_else(|| svm_reader.latest_blockhash());
+                    let expected_last_valid_block_height = svm_reader
+                        .last_valid_block_height_for_hash(&expected_blockhash)
+                        .unwrap();
+                    (expected_blockhash, expected_last_valid_block_height)
+                });
 
             assert_eq!(
                 res.value.blockhash,
@@ -3846,14 +4119,8 @@ mod tests {
                 &recent_blockhash,
             );
 
-            send_and_await_transaction(tx_1, setup.clone(), mempool_rx.clone())
-                .await
-                .join()
-                .unwrap();
-            send_and_await_transaction(tx_2, setup.clone(), mempool_rx)
-                .await
-                .join()
-                .unwrap();
+            let _ = send_and_await_transaction(tx_1, setup.clone(), mempool_rx.clone()).await;
+            let _ = send_and_await_transaction(tx_2, setup.clone(), mempool_rx).await;
             setup
                 .context
                 .svm_locker
@@ -4626,6 +4893,36 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_is_blockhash_valid_expired_by_age() {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+
+        setup.context.svm_locker.with_svm_writer(|svm| {
+            for _ in 0..=MAX_PROCESSING_AGE {
+                svm.confirm_current_block().unwrap();
+            }
+            assert!(
+                !svm.is_recent_blockhash_valid_for_processing(&recent_blockhash),
+                "test setup should expire the captured blockhash"
+            );
+        });
+
+        let result = setup
+            .rpc
+            .is_blockhash_valid(
+                Some(setup.context.clone()),
+                recent_blockhash.to_string(),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(result.value, false);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_is_blockhash_valid_invalid_blockhash() {
         let setup = TestSetup::new(SurfpoolFullRpc);
 
@@ -4939,20 +5236,16 @@ mod tests {
                 skip_sig_verify: Some(true),
             };
 
-            let setup_clone = setup.clone();
-            let handle = hiro_system_kit::thread_named("send_tx_skip_verify")
-                .spawn(move || {
-                    setup_clone.rpc.send_transaction(
-                        Some(setup_clone.context),
-                        tx_encoded,
-                        Some(config),
-                    )
-                })
-                .unwrap();
+            let result = setup
+                .rpc
+                .send_transaction(Some(setup.context.clone()), tx_encoded, Some(config))
+                .await;
 
             loop {
                 match mempool_rx.recv() {
-                    Ok(SimnetCommand::ProcessTransaction(_, tx, status_tx, _, _)) => {
+                    Ok(SimnetCommand::ProcessTransaction(request)) => {
+                        let tx = request.transaction;
+                        let status_tx = request.status_tx;
                         let mut writer = setup.context.svm_locker.0.write().await;
                         let slot = writer.get_latest_absolute_slot();
                         writer.transactions_queued_for_confirmation.push_back((
@@ -4977,23 +5270,74 @@ mod tests {
                                 ),
                             )
                             .unwrap();
-                        status_tx
-                            .send(TransactionStatusEvent::Success(
-                                TransactionConfirmationStatus::Processed,
-                            ))
-                            .unwrap();
+                        let _ = status_tx.send(TransactionStatusEvent::Success(
+                            TransactionConfirmationStatus::Processed,
+                        ));
                         break;
                     }
                     _ => continue,
                 }
             }
 
-            let result = handle.join().unwrap();
             assert!(
                 result.is_ok(),
                 "Transaction with skip_sig_verify=true should succeed: {:?}",
                 result
             );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_send_transaction_honors_global_skip_signature_verification() {
+            let payer = Keypair::new();
+            let recipient = Pubkey::new_unique();
+            let (mempool_tx, mempool_rx) = crossbeam_channel::unbounded();
+            let setup = TestSetup::new_with_mempool(SurfpoolFullRpc, mempool_tx);
+            let recent_blockhash = setup
+                .context
+                .svm_locker
+                .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+
+            // Operator launched with `--skip-signature-verification`; admission must
+            // honor it even though the per-request `skip_sig_verify` is unset.
+            setup
+                .context
+                .svm_locker
+                .with_svm_writer(|svm_writer| svm_writer.skip_signature_verification = true);
+
+            let _ = setup
+                .context
+                .svm_locker
+                .0
+                .write()
+                .await
+                .airdrop(&payer.pubkey(), 2 * LAMPORTS_PER_SOL);
+
+            let tx =
+                build_transaction_with_invalid_signature(&payer, &recipient, &recent_blockhash);
+            let tx_encoded = bs58::encode(bincode::serialize(&tx).unwrap()).into_string();
+
+            // No per-request override: rely solely on the global flag.
+            let config = SurfpoolRpcSendTransactionConfig {
+                base: RpcSendTransactionConfig::default(),
+                skip_sig_verify: None,
+            };
+
+            let signature = setup
+                .rpc
+                .send_transaction(Some(setup.context.clone()), tx_encoded, Some(config))
+                .await
+                .expect("global skip_signature_verification should bypass admission sigverify");
+            assert_eq!(signature, tx.signatures[0].to_string());
+
+            match mempool_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("transaction should be enqueued for execution")
+            {
+                SimnetCommand::ProcessTransaction(request) => {
+                    assert_eq!(request.transaction.signatures[0], tx.signatures[0]);
+                }
+                other => panic!("unexpected simnet command: {other:?}"),
+            }
         }
 
         #[test]

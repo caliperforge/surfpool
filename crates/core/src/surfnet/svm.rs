@@ -4922,6 +4922,7 @@ mod tests {
             max_profiles: 17,
             log_bytes_limit: None,
             skip_blockhash_check: true,
+            skip_signature_verification: true,
         };
         let (svm, _events_rx, _geyser_rx) = SurfnetSvm::new(config).unwrap();
 
@@ -4944,6 +4945,7 @@ mod tests {
             assert!(svm.registered_idls.get(&program_id).unwrap().is_some());
         }
         assert!(svm.skip_blockhash_check);
+        assert!(svm.skip_signature_verification);
     }
 
     #[test]
@@ -4956,6 +4958,7 @@ mod tests {
             max_profiles: 23,
             log_bytes_limit: None,
             skip_blockhash_check: false,
+            skip_signature_verification: false,
         };
         let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::new(config).unwrap();
         let epoch_info = EpochInfo {

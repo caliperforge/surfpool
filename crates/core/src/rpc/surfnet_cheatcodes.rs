@@ -4779,7 +4779,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_set_confidential_token_account_requires_aes_key_for_balance() {
+    async fn test_set_confidential_token_account_requires_aes_key() {
         use bytemuck::bytes_of;
         use spl_token_2022_interface::solana_zk_sdk::encryption::{
             elgamal::ElGamalKeypair, pod::elgamal::PodElGamalPubkey,
@@ -4794,12 +4794,14 @@ mod tests {
         let elgamal_b58 =
             bs58::encode(bytes_of(&PodElGamalPubkey::from(elgamal.pubkey_owned()))).into_string();
 
-        // amount > 0 but no aesKey: the owner couldn't decrypt the balance, so reject.
+        // No aesKey — even a zero-balance (receive-only) account needs one to
+        // produce a valid owner-decryptable `encrypt(0)`, so this must fail
+        // rather than write a placeholder ciphertext.
         let update = TokenAccountUpdate {
             confidential: Some(ConfidentialTransferAccountUpdate {
                 elgamal_pubkey: elgamal_b58,
                 aes_key: None,
-                amount: Some(1_000),
+                amount: None,
                 ..Default::default()
             }),
             ..Default::default()
@@ -4817,7 +4819,84 @@ mod tests {
             .await;
         assert!(
             result.is_err(),
-            "confidential amount > 0 without aesKey should fail"
+            "confidential account without aesKey should fail"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_confidential_token_account_zero_balance_decrypts_to_zero() {
+        use bytemuck::bytes_of;
+        use spl_token_2022_interface::{
+            extension::{
+                BaseStateWithExtensions, StateWithExtensions,
+                confidential_transfer::ConfidentialTransferAccount,
+            },
+            solana_zk_sdk::encryption::{
+                auth_encryption::{AeCiphertext, AeKey},
+                elgamal::ElGamalKeypair,
+                pod::elgamal::PodElGamalPubkey,
+            },
+        };
+        use surfpool_types::types::ConfidentialTransferAccountUpdate;
+
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let owner = Keypair::new();
+        let mint = Keypair::new();
+        let token_program = spl_token_2022_interface::id();
+
+        let elgamal = ElGamalKeypair::new_rand();
+        let elgamal_b58 =
+            bs58::encode(bytes_of(&PodElGamalPubkey::from(elgamal.pubkey_owned()))).into_string();
+        let ae_bytes = [9u8; 16];
+        let ae_b58 = bs58::encode(ae_bytes).into_string();
+
+        // Receive-only account: amount 0, but with aesKey it must store a real
+        // encrypt(0) the owner can decrypt (not an all-zero placeholder).
+        let update = TokenAccountUpdate {
+            confidential: Some(ConfidentialTransferAccountUpdate {
+                elgamal_pubkey: elgamal_b58,
+                aes_key: Some(ae_b58),
+                amount: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = client
+            .rpc
+            .set_token_account(
+                Some(client.context.clone()),
+                owner.pubkey().to_string(),
+                mint.pubkey().to_string(),
+                update,
+                Some(token_program.to_string()),
+            )
+            .await;
+        assert!(result.is_ok(), "setup failed: {:?}", result.err());
+
+        let ata = get_associated_token_address_with_program_id(
+            &owner.pubkey(),
+            &mint.pubkey(),
+            &token_program,
+        );
+        let account = client
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.inner.get_account(&ata).unwrap().unwrap());
+        let state =
+            StateWithExtensions::<spl_token_2022_interface::state::Account>::unpack(&account.data)
+                .expect("account should unpack with extensions");
+        let ext = state
+            .get_extension::<ConfidentialTransferAccount>()
+            .expect("confidential extension should be present");
+
+        let ae_key = AeKey::from(ae_bytes);
+        let ae_ct = AeCiphertext::try_from(ext.decryptable_available_balance)
+            .expect("decryptable balance should be a valid AES ciphertext");
+        assert_eq!(
+            ae_key.decrypt(&ae_ct),
+            Some(0),
+            "receive-only account's decryptable balance should decrypt to 0"
         );
     }
 }

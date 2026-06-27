@@ -1136,7 +1136,8 @@ fn decode_confidential_key(input: &str, expected_len: usize) -> Result<Vec<u8>, 
 /// directly, bypassing the on-chain configure / deposit / apply-pending-balance
 /// flow. The crypto split is: `available_balance` only needs the owner's
 /// ElGamal *public* key, while `decryptable_available_balance` needs the owner's
-/// AES *secret* key (so a spendable balance requires `aes_key`).
+/// AES *secret* key — so `aes_key` is required for every confidential account
+/// (it encrypts the balance, or zero, into the owner-readable field).
 pub fn build_confidential_token_account_data(
     base: &spl_token_2022_interface::state::Account,
     mint_has_transfer_fee: bool,
@@ -1149,24 +1150,30 @@ pub fn build_confidential_token_account_data(
 
     let amount = conf.amount.unwrap_or(0);
 
-    let decryptable_available_balance: PodAeCiphertext = match &conf.aes_key {
-        Some(aes_key_str) => {
-            let ae_bytes =
-                decode_confidential_key(aes_key_str, 16).map_err(|e| format!("aesKey: {e}"))?;
-            let ae_array: [u8; 16] = ae_bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| "aesKey: expected 16 bytes".to_string())?;
-            AeKey::from(ae_array).encrypt(amount).into()
-        }
-        None => {
-            if amount > 0 {
-                return Err("aesKey is required when confidential amount > 0 (without it the owner cannot decrypt or spend the balance)".to_string());
-            }
-            PodAeCiphertext::zeroed()
-        }
-    };
+    // `decryptable_available_balance` is what the owner (and wallets) decrypt to
+    // read their balance. It must be a real `AeKey::encrypt(amount)` — even for a
+    // zero balance, where it is `encrypt(0)`, mirroring the `decryptable_zero_balance`
+    // the on-chain `ConfigureAccount` requires. An all-zero placeholder is NOT a
+    // valid AES-GCM-SIV ciphertext and would fail owner-side reads, so `aesKey`
+    // is required for every confidential account (including receive-only ones).
+    let aes_key_str = conf.aes_key.as_ref().ok_or_else(|| {
+        "aesKey is required to produce the owner-decryptable available balance \
+         (even for a zero-balance receive-only account)"
+            .to_string()
+    })?;
+    let ae_bytes = decode_confidential_key(aes_key_str, 16).map_err(|e| format!("aesKey: {e}"))?;
+    let ae_array: [u8; 16] = ae_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "aesKey: expected 16 bytes".to_string())?;
+    let decryptable_available_balance: PodAeCiphertext =
+        AeKey::from(ae_array).encrypt(amount).into();
 
+    // `available_balance` is the authoritative ElGamal ciphertext the program
+    // does homomorphic math on. The all-zero ciphertext is the canonical valid
+    // encryption of zero (exactly what `process_configure_account` writes), so a
+    // zero-balance account starts from it; a funded account encrypts `amount`
+    // under the owner's ElGamal key.
     let available_balance: PodElGamalCiphertext = if amount > 0 {
         elgamal_pubkey.encrypt_u64(amount).into()
     } else {

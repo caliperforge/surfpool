@@ -926,9 +926,12 @@ pub struct ConfidentialTransferAccountUpdate {
     /// payment clients read it off the account to encrypt transfers.
     pub elgamal_pubkey: String,
     /// The owner's AES (authenticated-encryption) secret key (base58 or base64,
-    /// 16 bytes). Used to produce the `decryptable_available_balance` the owner
-    /// reads to learn its balance. Required when `amount` > 0; may be omitted
-    /// for a zero-balance receive-only account.
+    /// 16 bytes). Required. Produces the `decryptable_available_balance` the
+    /// owner reads to learn its balance — even a zero-balance receive-only
+    /// account needs a valid `encrypt(0)` here (a placeholder would fail
+    /// owner-side balance reads), so this is mandatory for every confidential
+    /// account. Modeled as `Option` only so the field can be validated with a
+    /// clear error message when omitted.
     pub aes_key: Option<String>,
     /// The confidential available balance to set (default 0).
     pub amount: Option<u64>,

@@ -2,7 +2,7 @@ use std::{collections::HashSet, vec};
 
 use agave_reserved_account_keys::ReservedAccountKeys;
 use base64::{Engine, prelude::BASE64_STANDARD};
-use bytemuck::{Pod, bytes_of, from_bytes};
+use bytemuck::{Pod, Zeroable, bytes_of, from_bytes};
 use chrono::Utc;
 use litesvm::types::TransactionMetadata;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -36,10 +36,24 @@ use solana_transaction_status::{
     parse_accounts::{parse_legacy_message_accounts, parse_v0_message_accounts},
     parse_ui_inner_instructions,
 };
-use spl_token_2022_interface::extension::{
-    StateWithExtensions, interest_bearing_mint::InterestBearingConfig,
-    scaled_ui_amount::ScaledUiAmountConfig,
+use spl_token_2022_interface::{
+    extension::{
+        BaseStateWithExtensions, BaseStateWithExtensionsMut, ExtensionType, StateWithExtensions,
+        StateWithExtensionsMut, confidential_transfer::ConfidentialTransferAccount,
+        confidential_transfer_fee::ConfidentialTransferFeeAmount,
+        interest_bearing_mint::InterestBearingConfig, scaled_ui_amount::ScaledUiAmountConfig,
+        transfer_fee::TransferFeeConfig,
+    },
+    solana_zk_sdk::encryption::{
+        auth_encryption::AeKey,
+        elgamal::ElGamalPubkey,
+        pod::{
+            auth_encryption::PodAeCiphertext,
+            elgamal::{PodElGamalCiphertext, PodElGamalPubkey},
+        },
+    },
 };
+use surfpool_types::types::ConfidentialTransferAccountUpdate;
 use txtx_addon_kit::indexmap::IndexMap;
 
 use crate::{
@@ -1081,6 +1095,137 @@ impl TokenAccount {
         }
         Ok(())
     }
+}
+
+/// Returns `true` if the given account bytes are a Token-2022 mint that carries
+/// the transfer-fee config extension. Used to decide whether a fabricated
+/// confidential account also needs the companion confidential-transfer
+/// fee-amount extension (which the real `ConfigureAccount` adds in that case).
+pub fn mint_has_transfer_fee_config(mint_data: &[u8]) -> bool {
+    StateWithExtensions::<spl_token_2022_interface::state::Mint>::unpack(mint_data)
+        .map(|mint| mint.get_extension::<TransferFeeConfig>().is_ok())
+        .unwrap_or(false)
+}
+
+/// Decode a confidential-transfer key (ElGamal pubkey or AES key) from a
+/// base58 or base64 string, validating the decoded length.
+fn decode_confidential_key(input: &str, expected_len: usize) -> Result<Vec<u8>, String> {
+    if let Ok(bytes) = bs58::decode(input).into_vec() {
+        if bytes.len() == expected_len {
+            return Ok(bytes);
+        }
+    }
+    let bytes = BASE64_STANDARD
+        .decode(input)
+        .map_err(|e| format!("expected base58 or base64 ({e})"))?;
+    if bytes.len() != expected_len {
+        return Err(format!(
+            "expected {expected_len} bytes, got {}",
+            bytes.len()
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Build the raw account data for a Token-2022 token account that carries the
+/// confidential-transfer extension (and, when `mint_has_transfer_fee` is set,
+/// the companion confidential-transfer fee-amount extension).
+///
+/// Test-only helper backing the `surfnet_setTokenAccount` cheatcode: it
+/// fabricates a configured (and optionally funded) confidential account
+/// directly, bypassing the on-chain configure / deposit / apply-pending-balance
+/// flow. The crypto split is: `available_balance` only needs the owner's
+/// ElGamal *public* key, while `decryptable_available_balance` needs the owner's
+/// AES *secret* key (so a spendable balance requires `aes_key`).
+pub fn build_confidential_token_account_data(
+    base: &spl_token_2022_interface::state::Account,
+    mint_has_transfer_fee: bool,
+    conf: &ConfidentialTransferAccountUpdate,
+) -> Result<Vec<u8>, String> {
+    let elgamal_bytes = decode_confidential_key(&conf.elgamal_pubkey, 32)
+        .map_err(|e| format!("elgamalPubkey: {e}"))?;
+    let elgamal_pubkey = ElGamalPubkey::try_from(elgamal_bytes.as_slice())
+        .map_err(|e| format!("elgamalPubkey: invalid ElGamal public key ({e})"))?;
+
+    let amount = conf.amount.unwrap_or(0);
+
+    let decryptable_available_balance: PodAeCiphertext = match &conf.aes_key {
+        Some(aes_key_str) => {
+            let ae_bytes =
+                decode_confidential_key(aes_key_str, 16).map_err(|e| format!("aesKey: {e}"))?;
+            let ae_array: [u8; 16] = ae_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| "aesKey: expected 16 bytes".to_string())?;
+            AeKey::from(ae_array).encrypt(amount).into()
+        }
+        None => {
+            if amount > 0 {
+                return Err("aesKey is required when confidential amount > 0 (without it the owner cannot decrypt or spend the balance)".to_string());
+            }
+            PodAeCiphertext::zeroed()
+        }
+    };
+
+    let available_balance: PodElGamalCiphertext = if amount > 0 {
+        elgamal_pubkey.encrypt_u64(amount).into()
+    } else {
+        PodElGamalCiphertext::zeroed()
+    };
+
+    let mut extension_types = vec![ExtensionType::ConfidentialTransferAccount];
+    if mint_has_transfer_fee {
+        extension_types.push(ExtensionType::ConfidentialTransferFeeAmount);
+    }
+    let account_len = ExtensionType::try_calculate_account_len::<
+        spl_token_2022_interface::state::Account,
+    >(&extension_types)
+    .map_err(|e| format!("failed to size confidential account: {e}"))?;
+
+    let mut buffer = vec![0u8; account_len];
+    let mut state =
+        StateWithExtensionsMut::<spl_token_2022_interface::state::Account>::unpack_uninitialized(
+            &mut buffer,
+        )
+        .map_err(|e| format!("failed to init confidential account buffer: {e}"))?;
+
+    state.base = *base;
+    state.pack_base();
+    state
+        .init_account_type()
+        .map_err(|e| format!("failed to set account type: {e}"))?;
+
+    {
+        let ct = state
+            .init_extension::<ConfidentialTransferAccount>(false)
+            .map_err(|e| format!("failed to init confidential extension: {e}"))?;
+        ct.approved = conf.approved.unwrap_or(true).into();
+        ct.elgamal_pubkey = PodElGamalPubkey::from(elgamal_pubkey);
+        ct.pending_balance_lo = PodElGamalCiphertext::zeroed();
+        ct.pending_balance_hi = PodElGamalCiphertext::zeroed();
+        ct.available_balance = available_balance;
+        ct.decryptable_available_balance = decryptable_available_balance;
+        ct.allow_confidential_credits = conf.allow_confidential_credits.unwrap_or(true).into();
+        ct.allow_non_confidential_credits =
+            conf.allow_non_confidential_credits.unwrap_or(true).into();
+        ct.pending_balance_credit_counter = 0u64.into();
+        ct.maximum_pending_balance_credit_counter = conf
+            .maximum_pending_balance_credit_counter
+            .unwrap_or(65536)
+            .into();
+        ct.expected_pending_balance_credit_counter = 0u64.into();
+        ct.actual_pending_balance_credit_counter = 0u64.into();
+    }
+
+    if mint_has_transfer_fee {
+        let fee_amount = state
+            .init_extension::<ConfidentialTransferFeeAmount>(false)
+            .map_err(|e| format!("failed to init confidential fee extension: {e}"))?;
+        fee_amount.withheld_amount = PodElGamalCiphertext::zeroed();
+    }
+
+    drop(state);
+    Ok(buffer)
 }
 
 impl_token_program_packable_serde!(

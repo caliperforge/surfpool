@@ -32,7 +32,10 @@ use crate::{
         utils::{verify_pubkey, verify_pubkeys},
     },
     surfnet::{GetAccountResult, locker::SvmAccessContext},
-    types::{TimeTravelConfig, TokenAccount},
+    types::{
+        TimeTravelConfig, TokenAccount, build_confidential_token_account_data,
+        mint_has_transfer_fee_config,
+    },
 };
 
 pub trait AccountUpdateExt {
@@ -1559,10 +1562,24 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
         };
 
         Box::pin(async move {
+            let confidential = update.confidential.clone();
+
+            if confidential.is_some() && token_program_id != spl_token_2022_interface::id() {
+                return Err(Error::invalid_params(
+                    "confidential transfer accounts require the Token-2022 program (set tokenProgram to the Token-2022 program id)".to_string(),
+                ));
+            }
+
             let get_mint_result = svm_locker
                 .get_account(&remote_ctx, &mint, None)
                 .await?
                 .inner;
+            // Mirror the real `ConfigureAccount`: when the mint charges a
+            // transfer fee, a confidential account also needs the companion
+            // confidential-transfer fee-amount extension.
+            let mint_has_transfer_fee = confidential.is_some()
+                && !get_mint_result.is_none()
+                && mint_has_transfer_fee_config(get_mint_result.expected_data());
             svm_locker.write_account_update(get_mint_result);
 
             let minimum_rent = svm_locker.with_svm_reader(|svm_reader| {
@@ -1612,10 +1629,34 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
 
             update.apply(&mut token_account_data)?;
 
-            let final_account_bytes = token_account_data.pack_into_vec();
+            let (final_account_bytes, final_lamports) = if let Some(conf) = &confidential {
+                // Confidential accounts carry the Token-2022 confidential-transfer
+                // extension, so the base-only packing path can't represent them.
+                let base = match &token_account_data {
+                    TokenAccount::SplToken2022(base) => *base,
+                    TokenAccount::SplToken(_) => {
+                        return Err(Error::invalid_params(
+                            "confidential transfer accounts require the Token-2022 program"
+                                .to_string(),
+                        ));
+                    }
+                };
+                let data =
+                    build_confidential_token_account_data(&base, mint_has_transfer_fee, conf)
+                        .map_err(Error::invalid_params)?;
+                let rent = svm_locker.with_svm_reader(|svm_reader| {
+                    svm_reader
+                        .inner
+                        .minimum_balance_for_rent_exemption(data.len())
+                });
+                (data, rent)
+            } else {
+                (token_account_data.pack_into_vec(), initial_lamports)
+            };
+
             token_account.apply_update(|account| {
                 // If this is a native mint, we need to adjust the lamports to match the wrapped SOL amount + rent
-                account.lamports = initial_lamports;
+                account.lamports = final_lamports;
                 account.data = final_account_bytes.clone();
                 Ok(())
             })?;
@@ -4644,6 +4685,139 @@ mod tests {
         assert!(
             result.is_err(),
             "stream_accounts with invalid pubkey should fail"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_confidential_token_account_spendable() {
+        use bytemuck::bytes_of;
+        use spl_token_2022_interface::{
+            extension::{
+                BaseStateWithExtensions, StateWithExtensions,
+                confidential_transfer::ConfidentialTransferAccount,
+            },
+            solana_zk_sdk::encryption::{
+                auth_encryption::{AeCiphertext, AeKey},
+                elgamal::ElGamalKeypair,
+                pod::elgamal::PodElGamalPubkey,
+            },
+        };
+        use surfpool_types::types::ConfidentialTransferAccountUpdate;
+
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let owner = Keypair::new();
+        let mint = Keypair::new();
+        let token_program = spl_token_2022_interface::id();
+
+        // Owner's confidential keys (in practice derived from the wallet signer).
+        let elgamal = ElGamalKeypair::new_rand();
+        let elgamal_pubkey_pod = PodElGamalPubkey::from(elgamal.pubkey_owned());
+        let elgamal_b58 = bs58::encode(bytes_of(&elgamal_pubkey_pod)).into_string();
+        let ae_bytes = [7u8; 16];
+        let ae_b58 = bs58::encode(ae_bytes).into_string();
+        let amount = 5_000u64;
+
+        let update = TokenAccountUpdate {
+            confidential: Some(ConfidentialTransferAccountUpdate {
+                elgamal_pubkey: elgamal_b58,
+                aes_key: Some(ae_b58),
+                amount: Some(amount),
+                approved: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = client
+            .rpc
+            .set_token_account(
+                Some(client.context.clone()),
+                owner.pubkey().to_string(),
+                mint.pubkey().to_string(),
+                update,
+                Some(token_program.to_string()),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "set_token_account failed: {:?}",
+            result.err()
+        );
+
+        let ata = get_associated_token_address_with_program_id(
+            &owner.pubkey(),
+            &mint.pubkey(),
+            &token_program,
+        );
+        let account = client
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.inner.get_account(&ata).unwrap().unwrap());
+
+        let state =
+            StateWithExtensions::<spl_token_2022_interface::state::Account>::unpack(&account.data)
+                .expect("account should unpack with extensions");
+        let ext = state
+            .get_extension::<ConfidentialTransferAccount>()
+            .expect("confidential extension should be present");
+
+        assert!(bool::from(ext.approved), "account should be approved");
+        assert_eq!(
+            ext.elgamal_pubkey, elgamal_pubkey_pod,
+            "stored ElGamal pubkey should match"
+        );
+
+        // The owner can decrypt the balance with its AES key.
+        let ae_key = AeKey::from(ae_bytes);
+        let ae_ct = AeCiphertext::try_from(ext.decryptable_available_balance)
+            .expect("decryptable balance should decode");
+        assert_eq!(
+            ae_key.decrypt(&ae_ct),
+            Some(amount),
+            "decryptable available balance should decrypt to the requested amount"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_confidential_token_account_requires_aes_key_for_balance() {
+        use bytemuck::bytes_of;
+        use spl_token_2022_interface::solana_zk_sdk::encryption::{
+            elgamal::ElGamalKeypair, pod::elgamal::PodElGamalPubkey,
+        };
+        use surfpool_types::types::ConfidentialTransferAccountUpdate;
+
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let owner = Keypair::new();
+        let mint = Keypair::new();
+
+        let elgamal = ElGamalKeypair::new_rand();
+        let elgamal_b58 =
+            bs58::encode(bytes_of(&PodElGamalPubkey::from(elgamal.pubkey_owned()))).into_string();
+
+        // amount > 0 but no aesKey: the owner couldn't decrypt the balance, so reject.
+        let update = TokenAccountUpdate {
+            confidential: Some(ConfidentialTransferAccountUpdate {
+                elgamal_pubkey: elgamal_b58,
+                aes_key: None,
+                amount: Some(1_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = client
+            .rpc
+            .set_token_account(
+                Some(client.context.clone()),
+                owner.pubkey().to_string(),
+                mint.pubkey().to_string(),
+                update,
+                Some(spl_token_2022_interface::id().to_string()),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "confidential amount > 0 without aesKey should fail"
         );
     }
 }

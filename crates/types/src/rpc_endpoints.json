@@ -667,7 +667,8 @@
                 "delegate": "Option<SetSomeAccount>",
                 "state": "Option<string> ('uninitialized', 'frozen', 'initialized')",
                 "delegated_amount": "Option<u64>",
-                "close_authority": "Option<SetSomeAccount>"
+                "close_authority": "Option<SetSomeAccount>",
+                "confidential": "Option<ConfidentialTransferAccountUpdate> (Token-2022 only; configures the confidential-transfer extension. Fields: elgamalPubkey (string, 32 bytes base58/base64, required), aesKey (Option<string>, 16 bytes base58/base64; required when amount > 0), amount (Option<u64>, default 0), approved (Option<bool>, default true), allowConfidentialCredits (Option<bool>, default true), allowNonConfidentialCredits (Option<bool>, default true), maximumPendingBalanceCreditCounter (Option<u64>, default 65536))"
               }
             },
             {

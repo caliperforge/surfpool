@@ -646,7 +646,7 @@
         },
         {
           "method": "surfnet_setTokenAccount",
-          "description": "A 'cheat code' method for developers to set or update a token account in Surfpool. It allows for updating properties like amount, delegate, state, delegated amount, and close authority. This is designed to help developers quickly modify token account properties like amounts, delegates, and authorities.",
+          "description": "A 'cheat code' method for developers to set or update a token account in Surfpool. It allows for updating properties like amount, delegate, state, delegated amount, and close authority. It can also configure (and optionally fund) a Token-2022 confidential-transfer account via the `update.confidential` field, letting tests skip the real multi-transaction Configure/Deposit/ApplyPendingBalance flow. This is designed to help developers quickly modify token account properties.",
           "params": [
             {
               "name": "owner",
@@ -689,6 +689,24 @@
                 "amount": 1000,
                 "state": "initialized"
               }
+            ]
+          },
+          "confidentialExample": {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "surfnet_setTokenAccount",
+            "params": [
+              "owner_pubkey",
+              "mint_pubkey",
+              {
+                "confidential": {
+                  "elgamalPubkey": "<base58, 32 bytes>",
+                  "aesKey": "<base58, 16 bytes>",
+                  "amount": 100000000,
+                  "approved": true
+                }
+              },
+              "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
             ]
           }
         },

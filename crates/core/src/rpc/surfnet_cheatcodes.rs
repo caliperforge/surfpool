@@ -280,7 +280,12 @@ pub trait SurfnetCheatcodes {
     /// ## Parameters
     /// - `owner`: The base-58 encoded public key of the token account's owner.
     /// - `mint`: The base-58 encoded public key of the token mint (e.g., the token type).
-    /// - `update`: The `TokenAccountUpdate` struct containing the fields to update the token account.
+    /// - `update`: A `TokenAccountUpdate` with the fields to set (all optional):
+    ///   - `amount` (u64): the public (non-confidential) token balance.
+    ///   - `delegate` / `closeAuthority`: a base-58 pubkey, or the string `"null"` to clear it.
+    ///   - `delegatedAmount` (u64), `state` (`"initialized"` | `"frozen"` | `"uninitialized"`).
+    ///   - `confidential`: configure the Token-2022 confidential-transfer extension
+    ///     (Token-2022 only) — see "Confidential transfers" below.
     /// - `token_program`: The optional base-58 encoded address of the token program (defaults to the system token program).
     ///
     /// ## Returns
@@ -302,6 +307,49 @@ pub trait SurfnetCheatcodes {
     ///   "jsonrpc": "2.0",
     ///   "result": {},
     ///   "id": 1
+    /// }
+    /// ```
+    ///
+    /// ## Confidential transfers (Token-2022)
+    /// When `update.confidential` is set, the account is (re)built with the
+    /// Token-2022 `ConfidentialTransferAccount` extension — configured, approved,
+    /// and optionally pre-funded — so tests skip the real multi-transaction
+    /// `ConfigureAccount → Deposit → ApplyPendingBalance` flow. The companion
+    /// `ConfidentialTransferFeeAmount` extension is added automatically when the
+    /// mint has a transfer-fee config. Requires the Token-2022 program.
+    ///
+    /// `confidential` fields:
+    /// - `elgamalPubkey` (required): the owner's ElGamal public key (base58/base64,
+    ///   32 bytes); confidential amounts are encrypted to this key.
+    /// - `aesKey` (required): the owner's AES key (base58/base64, 16 bytes); produces
+    ///   the owner-decryptable available balance — `encrypt(0)` for a zero balance.
+    /// - `amount` (u64, default 0): confidential available balance to fund.
+    /// - `approved` (bool, default true), `allowConfidentialCredits` (default true),
+    ///   `allowNonConfidentialCredits` (default true),
+    ///   `maximumPendingBalanceCreditCounter` (u64, default 65536).
+    ///
+    /// Both keys are derived deterministically from the owner's wallet signature, so
+    /// the caller (who holds the keypair) derives and passes them in. `amount`/`aesKey`
+    /// fund the owner-readable side; only `elgamalPubkey` is needed to encrypt the
+    /// authoritative ElGamal balance.
+    ///
+    /// ### Example Request (configure + fund a confidential account)
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "id": 1,
+    ///   "method": "surfnet_setTokenAccount",
+    ///   "params": [
+    ///     "owner_pubkey",
+    ///     "mint_pubkey",
+    ///     { "confidential": {
+    ///         "elgamalPubkey": "<base58, 32 bytes>",
+    ///         "aesKey": "<base58, 16 bytes>",
+    ///         "amount": 100000000,
+    ///         "approved": true
+    ///     } },
+    ///     "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+    ///   ]
     /// }
     /// ```
     ///

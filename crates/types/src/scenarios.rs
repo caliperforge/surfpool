@@ -133,7 +133,7 @@ impl PdaSeed {
                 values?.get(prop).and_then(|v| {
                     // Handle numeric values - convert to u16 big-endian
                     if let Some(n) = v.as_u64() {
-                        let n16 = n as u16;
+                        let n16 = u16::try_from(n).ok()?;
                         return Some(n16.to_be_bytes().to_vec());
                     }
                     None
@@ -1088,5 +1088,30 @@ impl From<YamlPdaSeed> for PdaSeed {
                 seeds: seeds.into_iter().map(|s| s.into()).collect(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use serde_json::json;
+
+    use super::PdaSeed;
+
+    #[test]
+    fn u16_be_ref_rejects_out_of_range_values() {
+        let seed = PdaSeed::U16BeRef("index".to_string());
+        let values = HashMap::from([("index".to_string(), json!(70_000))]);
+
+        assert_eq!(seed.to_bytes(Some(&values)), None);
+    }
+
+    #[test]
+    fn u16_be_ref_encodes_in_range_values() {
+        let seed = PdaSeed::U16BeRef("index".to_string());
+        let values = HashMap::from([("index".to_string(), json!(513))]);
+
+        assert_eq!(seed.to_bytes(Some(&values)), Some(vec![2, 1]));
     }
 }

@@ -637,9 +637,14 @@ impl Surfpool {
                     }
                 }
 
-                // After extracting values from seeds, rebuild the account from template
-                // This ensures the PDA is correctly constructed with property references
-                override_instance.account = template.address.clone();
+                // PDA templates derive their account from template seeds plus values.
+                // Fixed-address templates may intentionally receive a caller-provided pubkey.
+                if matches!(
+                    &template.address,
+                    surfpool_types::AccountAddress::Pda { .. }
+                ) {
+                    override_instance.account = template.address.clone();
+                }
 
                 // Validate constant_ref values against template constants
                 for prop in &template.properties {
@@ -818,6 +823,7 @@ impl Surfpool {
                     "accountType": t.account_type,
                     "properties": t.properties,
                     "address": t.address,
+                    "constants": t.constants,
                     "tags": t.tags
                 });
                 // Include llm_context if present
@@ -942,6 +948,7 @@ impl ServerHandler for Surfpool {
                             "accountType": t.account_type,
                             "properties": t.properties,
                             "address": t.address,
+                            "constants": t.constants,
                             "tags": t.tags
                         });
                         // Include llm_context if present

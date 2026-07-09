@@ -73,15 +73,6 @@ function generateLabel(symbolA, symbolB) {
   return `${normA}/${normB}`;
 }
 
-function formatVolume(volume) {
-  if (volume >= 1000000) {
-    return `$${(volume / 1000000).toFixed(1)}M`;
-  } else if (volume >= 1000) {
-    return `$${(volume / 1000).toFixed(0)}K`;
-  }
-  return `$${volume.toFixed(0)}`;
-}
-
 function generateOptionsYaml(pools) {
   const lines = [];
 
@@ -92,13 +83,11 @@ function generateOptionsYaml(pools) {
     const id = generateId(symbolA, symbolB);
     const label = generateLabel(symbolA, symbolB);
     const marketId = pool.marketId;
-    const volumeMonth = pool.month?.volume || 0;
-    const volumeStr = formatVolume(volumeMonth);
 
     lines.push(`      - id: "${id}"`);
     lines.push(`        label: "${label}"`);
     lines.push(`        value: "${marketId}"`);
-    lines.push(`        description: "${label} AMM v4 pool (30d vol: ${volumeStr})"`);
+    lines.push(`        description: "${label} AMM v4 pool"`);
   }
 
   return lines.join('\n');

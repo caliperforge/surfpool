@@ -9,11 +9,6 @@ pub const JUPITER_V6_IDL_CONTENT: &str = include_str!("./protocols/jupiter/v6/id
 pub const JUPITER_V6_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/jupiter/v6/overrides.yaml");
 
-pub const SWITCHBOARD_ON_DEMAND_IDL_CONTENT: &str =
-    include_str!("./protocols/switchboard/v2/idl.json");
-pub const SWITCHBOARD_ON_DEMAND_OVERRIDES_CONTENT: &str =
-    include_str!("./protocols/switchboard/v2/overrides.yaml");
-
 pub const RAYDIUM_CLMM_IDL_CONTENT: &str = include_str!("./protocols/raydium/v3/idl.json");
 pub const RAYDIUM_CLMM_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/raydium/v3/overrides.yaml");
@@ -51,7 +46,6 @@ impl TemplateRegistry {
         default.load_pyth_overrides();
         default.load_jupiter_overrides();
         default.load_raydium_overrides();
-        default.load_switchboard_on_demand_overrides();
         default.load_meteora_overrides();
         default.load_kamino_overrides();
         default.load_drift_overrides();
@@ -70,14 +64,6 @@ impl TemplateRegistry {
             JUPITER_V6_OVERRIDES_CONTENT,
             "jupiter",
         );
-    }
-
-    pub fn load_switchboard_on_demand_overrides(&mut self) {
-        // self.load_protocol_overrides(
-        //     SWITCHBOARD_ON_DEMAND_IDL_CONTENT,
-        //     SWITCHBOARD_ON_DEMAND_OVERRIDES_CONTENT,
-        //     "switchboard-v2",
-        // );
     }
 
     pub fn load_meteora_overrides(&mut self) {
@@ -203,7 +189,6 @@ mod tests {
         let registry = TemplateRegistry::new();
 
         // Should have Pyth (1 template) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift(4) + Meteora (2) + Kamino(3) + Whirlpool(6) + SPL Token (2) = 24 total
-        // Note: Switchboard is disabled/commented out
         assert_eq!(
             registry.count(),
             24,
@@ -220,9 +205,6 @@ mod tests {
         assert!(registry.contains("raydium-amm-fees"));
         assert!(registry.contains("raydium-amm-swap-stats"));
         assert!(registry.contains("raydium-amm-custom"));
-
-        // Note: Switchboard is disabled/commented out
-        // assert!(registry.contains("switchboard-quote-override"));
 
         assert!(registry.contains("meteora-dlmm-sol-usdc"));
         assert!(registry.contains("meteora-dlmm-usdt-sol"));
@@ -305,7 +287,7 @@ mod tests {
         assert_eq!(
             oracle_templates.len(),
             1,
-            "Should find 1 oracle template (Pyth only, Switchboard is disabled)"
+            "Should find 1 oracle template (Pyth)"
         );
 
         let dex_templates = registry.by_tags(&[vec!["dex".to_string()]].concat());
@@ -754,67 +736,4 @@ mod tests {
             resolved_address, expected_address
         );
     }
-}
-
-// NOTE: Switchboard loading is currently disabled in load_switchboard_on_demand_overrides
-// These tests are ignored until it's re-enabled
-#[test]
-#[ignore = "Switchboard loading is disabled"]
-fn test_switchboard_template_loads_correctly() {
-    let registry = TemplateRegistry::new();
-
-    let switchboard_template = registry
-        .get("switchboard-quote-override")
-        .expect("Switchboard template should exist");
-
-    assert_eq!(switchboard_template.protocol, "Switchboard");
-    assert_eq!(switchboard_template.account_type, "SwitchboardQuote");
-    assert_eq!(
-        switchboard_template.name,
-        "Override Switchboard Oracle Quote"
-    );
-
-    assert_eq!(switchboard_template.properties.len(), 3);
-    let property_paths: Vec<&str> = switchboard_template.property_paths();
-    assert!(property_paths.contains(&"queue"));
-    assert!(property_paths.contains(&"slot"));
-    assert!(property_paths.contains(&"version"));
-
-    assert!(switchboard_template.tags.contains(&"oracle".to_string()));
-    assert!(
-        switchboard_template
-            .tags
-            .contains(&"price-feed".to_string())
-    );
-}
-
-#[test]
-#[ignore = "Switchboard loading is disabled"]
-fn test_switchboard_idl_has_quote_account() {
-    let registry = TemplateRegistry::new();
-    let switchboard_template = registry.get("switchboard-quote-override").unwrap();
-
-    let has_quote_account = switchboard_template
-        .idl
-        .accounts
-        .iter()
-        .any(|acc| acc.name == "SwitchboardQuote");
-
-    assert!(
-        has_quote_account,
-        "IDL should contain SwitchboardQuote account"
-    );
-}
-
-#[test]
-#[ignore = "Switchboard loading is disabled"]
-fn test_filter_by_oracle_tag_includes_switchboard() {
-    let registry = TemplateRegistry::new();
-
-    let oracle_templates = registry.by_tags(&[vec!["oracle".to_string()]].concat());
-    // Should include Pyth (4) + Switchboard (1) = 5
-    assert!(
-        oracle_templates.len() >= 5,
-        "Should find at least 5 oracle templates (Pyth + Switchboard)"
-    );
 }

@@ -6516,7 +6516,8 @@ mod tests {
         use surfpool_types::AccountSnapshot;
         use tempfile::NamedTempFile;
 
-        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::new(None, "test").unwrap();
+        let (mut svm, _events_rx, _geyser_rx) =
+            SurfnetSvm::new(SurfnetSvmConfig::default()).unwrap();
 
         // Create test accounts with different characteristics
         let test_accounts: Vec<(Pubkey, Account)> = vec![
@@ -6610,7 +6611,8 @@ mod tests {
         let snapshot_path = temp_file.path().to_str().unwrap();
 
         // Create a new SVM instance and restore the snapshot
-        let (mut svm2, _events_rx2, _geyser_rx2) = SurfnetSvm::new(None, "test").unwrap();
+        let (mut svm2, _events_rx2, _geyser_rx2) =
+            SurfnetSvm::new(SurfnetSvmConfig::default()).unwrap();
 
         // Verify accounts don't exist in new SVM
         for (pubkey, _) in &test_accounts {
@@ -6671,7 +6673,8 @@ mod tests {
 
     #[test]
     fn test_snapshot_restore_invalid_file() {
-        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::new(None, "test").unwrap();
+        let (mut svm, _events_rx, _geyser_rx) =
+            SurfnetSvm::new(SurfnetSvmConfig::default()).unwrap();
 
         // Test with non-existent file
         let result = svm.restore_from_snapshot("/nonexistent/path/to/snapshot.json");
@@ -6699,7 +6702,8 @@ mod tests {
         use surfpool_types::AccountSnapshot;
         use tempfile::NamedTempFile;
 
-        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::new(None, "test").unwrap();
+        let (mut svm, _events_rx, _geyser_rx) =
+            SurfnetSvm::new(SurfnetSvmConfig::default()).unwrap();
 
         // Create a snapshot with one valid and one invalid account
         let mut snapshot: HashMap<String, AccountSnapshot> = HashMap::new();

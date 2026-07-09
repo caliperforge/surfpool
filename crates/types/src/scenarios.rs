@@ -319,8 +319,15 @@ impl Property {
     }
 }
 
-// Keep backward compatibility with old PropertyType enum
-/// Defines the type of a property in a template (deprecated, use Property instead)
+/// Legacy tagged property representation.
+///
+/// Use [`Property`] for new code. This type remains deserializable for callers
+/// that still send the old tagged JSON shape, such as
+/// `{"type":"field","name":"price"}`.
+#[deprecated(
+    since = "1.4.0",
+    note = "use Property; PropertyType remains only for legacy tagged JSON compatibility"
+)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum PropertyType {
@@ -330,6 +337,7 @@ pub enum PropertyType {
     ConstantRef { name: String, constant: String },
 }
 
+#[allow(deprecated)]
 impl PropertyType {
     /// Get the property name regardless of type
     pub fn name(&self) -> &str {
@@ -353,6 +361,7 @@ impl PropertyType {
     }
 }
 
+#[allow(deprecated)]
 impl From<PropertyType> for Property {
     fn from(pt: PropertyType) -> Self {
         match pt {
@@ -864,6 +873,7 @@ impl From<YamlPropertyType> for Property {
     }
 }
 
+#[allow(deprecated)]
 impl From<YamlPropertyType> for PropertyType {
     fn from(yaml: YamlPropertyType) -> Self {
         match yaml {

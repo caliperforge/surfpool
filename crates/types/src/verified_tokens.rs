@@ -11,15 +11,9 @@ pub struct TokenInfo {
     pub logo_uri: Option<String>,
 }
 
-/// Parse a CSV field, handling quoted strings
+/// Normalize a CSV field after `parse_csv_line` has already handled quoting.
 fn parse_csv_field(field: &str) -> String {
-    let field = field.trim();
-    if field.starts_with('"') && field.ends_with('"') && field.len() >= 2 {
-        // Remove surrounding quotes and unescape doubled quotes
-        field[1..field.len() - 1].replace("\"\"", "\"")
-    } else {
-        field.to_string()
-    }
+    field.trim().to_string()
 }
 
 /// Parse a CSV line into fields, handling quoted strings with commas
@@ -88,3 +82,22 @@ pub static VERIFIED_TOKENS_BY_SYMBOL: Lazy<HashMap<String, TokenInfo>> = Lazy::n
 
     map
 });
+
+#[cfg(test)]
+mod tests {
+    use super::parse_csv_line;
+
+    #[test]
+    fn parse_csv_line_handles_quoted_fields() {
+        let fields = parse_csv_line(r#"address,"Token, Inc.",TKN,,9"#);
+
+        assert_eq!(fields, ["address", "Token, Inc.", "TKN", "", "9"]);
+    }
+
+    #[test]
+    fn parse_csv_line_preserves_literal_edge_quotes() {
+        let fields = parse_csv_line(r#"address,"""quoted""",QT,,6"#);
+
+        assert_eq!(fields[1], r#""quoted""#);
+    }
+}

@@ -5160,10 +5160,6 @@ mod tests {
         assert!(!svm.feature_set.is_active(&blake3_syscall_enabled::id()));
         assert!(
             !svm.feature_set
-                .is_active(&enable_sbpf_v3_deployment_and_execution::id())
-        );
-        assert!(
-            !svm.feature_set
                 .is_active(&raise_cpi_nesting_limit_to_8::id())
         );
         assert!(
@@ -5181,6 +5177,10 @@ mod tests {
         assert!(
             svm.feature_set
                 .is_active(&enable_sbpf_v2_deployment_and_execution::id())
+        );
+        assert!(
+            svm.feature_set
+                .is_active(&enable_sbpf_v3_deployment_and_execution::id())
         );
         assert!(
             svm.feature_set

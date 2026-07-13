@@ -147,14 +147,14 @@ impl SurfnetLiteSvm {
 
     pub fn get_sysvar<T>(&self) -> T
     where
-        T: solana_sysvar::Sysvar + solana_sysvar_id::SysvarId + serde::de::DeserializeOwned,
+        T: solana_sysvar::Sysvar + solana_sysvar_id::SysvarId + wincode::DeserializeOwned<Dst = T>,
     {
         self.svm.get_sysvar()
     }
 
     pub fn set_sysvar<T>(&mut self, sysvar: &T)
     where
-        T: solana_sysvar::Sysvar + solana_sysvar_id::SysvarId + solana_sysvar::SysvarSerialize,
+        T: solana_sysvar::Sysvar + solana_sysvar_id::SysvarId + wincode::Serialize<Src = T>,
     {
         self.svm.set_sysvar(sysvar);
     }

@@ -3499,10 +3499,8 @@ impl SurfnetSvm {
                             self.transactions.get(&signature.to_string()).ok().flatten()
                         {
                             let (tx_meta, _) = tx_data.as_ref();
-                            let mut accounts = match &tx_meta.transaction.message {
-                                VersionedMessage::Legacy(msg) => msg.account_keys.clone(),
-                                VersionedMessage::V0(msg) => msg.account_keys.clone(),
-                            };
+                            let mut accounts =
+                                tx_meta.transaction.message.static_account_keys().to_vec();
 
                             accounts.extend(&tx_meta.meta.loaded_addresses.writable);
                             accounts.extend(&tx_meta.meta.loaded_addresses.readonly);

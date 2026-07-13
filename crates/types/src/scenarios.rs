@@ -325,7 +325,7 @@ impl Property {
 /// that still send the old tagged JSON shape, such as
 /// `{"type":"field","name":"price"}`.
 #[deprecated(
-    since = "1.4.0",
+    since = "1.5.0",
     note = "use Property; PropertyType remains only for legacy tagged JSON compatibility"
 )]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

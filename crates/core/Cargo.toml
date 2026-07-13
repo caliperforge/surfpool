@@ -91,6 +91,7 @@ spl-token-2022-interface = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
+wincode = { workspace = true }
 
 surfpool-db = { workspace = true }
 surfpool-types = { workspace = true }

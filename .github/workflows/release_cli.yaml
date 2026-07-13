@@ -69,11 +69,11 @@ jobs:
             platform: windows
             target: x86_64-pc-windows-msvc
             architecture: x64
-          - os: macos-latest
+          - os: macos-15-intel
             platform: darwin
             target: x86_64-apple-darwin
             architecture: x64
-          - os: macos-latest
+          - os: macos-15
             platform: darwin
             target: aarch64-apple-darwin
             architecture: arm64
@@ -92,10 +92,10 @@ jobs:
 
       # set up rust for all envs
       - name: Install Rust toolchain
-        run: rustup toolchain install 1.86.0 --profile minimal --target ${{ matrix.target }}
-
-      - name: Install Rust Target
-        run: rustup target add ${{ matrix.target }}
+        shell: bash
+        run: |
+          RUST_TOOLCHAIN=$(awk -F '"' '/^channel/{print $2}' rust-toolchain)
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target ${{ matrix.target }}
 
       # env vars unix
       - name: Get Rust version (unix)
@@ -114,9 +114,9 @@ jobs:
           path: |
             ~/.cargo/
             ./target/${{ matrix.target }}/release/
-          key: ${{ runner.os }}-rust-${{ env.RUST_VERSION_HASH }}-cargo-${{ hashFiles('./Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.target }}-rust-${{ env.RUST_VERSION_HASH }}-cargo-${{ hashFiles('./Cargo.lock') }}
 
-      # Set environment variables required from cross compiling from macos-x86_64 to macos-arm64
+      # Set deployment environment for the macOS arm64 build
       - name: Configure macos-arm64 cross compile config
         if: matrix.target == 'aarch64-apple-darwin'
         run: |
@@ -124,23 +124,23 @@ jobs:
           echo "MACOSX_DEPLOYMENT_TARGET=$(xcrun -sdk macosx --show-sdk-platform-version)" >> $GITHUB_ENV
 
       - name: Configure openssl (macos x64)
-        if: matrix.os == 'macos-latest' && matrix.architecture == 'x64'
+        if: matrix.platform == 'darwin' && matrix.architecture == 'x64'
         run: |
-          brew install openssl@1.1
-          echo "OPENSSL_DIR=$(brew --prefix openssl@1.1)" >> $GITHUB_ENV
-          echo "OPENSSL_INCLUDE_DIR=$(brew --prefix openssl@1.1)/include" >> $GITHUB_ENV
-          echo "OPENSSL_LIB_DIR=$(brew --prefix openssl@1.1)/lib" >> $GITHUB_ENV
+          brew install openssl@3
+          echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> $GITHUB_ENV
+          echo "OPENSSL_INCLUDE_DIR=$(brew --prefix openssl@3)/include" >> $GITHUB_ENV
+          echo "OPENSSL_LIB_DIR=$(brew --prefix openssl@3)/lib" >> $GITHUB_ENV
 
       - name: Configure openssl (macos arm64)
-        if: matrix.os == 'macos-latest' && matrix.architecture == 'arm64'
+        if: matrix.platform == 'darwin' && matrix.architecture == 'arm64'
         run: |
-          brew install openssl@1.1
-          echo "OPENSSL_DIR=$(brew --prefix openssl@1.1)" >> $GITHUB_ENV
-          echo "OPENSSL_INCLUDE_DIR=$(brew --prefix openssl@1.1)/include" >> $GITHUB_ENV
-          echo "OPENSSL_LIB_DIR=$(brew --prefix openssl@1.1)/lib" >> $GITHUB_ENV
+          brew install openssl@3
+          echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> $GITHUB_ENV
+          echo "OPENSSL_INCLUDE_DIR=$(brew --prefix openssl@3)/include" >> $GITHUB_ENV
+          echo "OPENSSL_LIB_DIR=$(brew --prefix openssl@3)/lib" >> $GITHUB_ENV
 
       - name: Install LLVM (macOS)
-        if: matrix.os == 'macos-latest'
+        if: matrix.platform == 'darwin'
         run: |
           brew install llvm
           echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> $GITHUB_ENV
@@ -201,11 +201,11 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }} --features supervisor_ui --features version_check
 
       - name: Build - Cargo (macOS x64)
-        if: matrix.os == 'macos-latest' && matrix.architecture == 'x64'
+        if: matrix.platform == 'darwin' && matrix.architecture == 'x64'
         run: cargo build --release --locked --target ${{ matrix.target }} --features supervisor_ui --features version_check
 
       - name: Build - Cargo (macOS ARM64)
-        if: matrix.os == 'macos-latest' && matrix.architecture == 'arm64'
+        if: matrix.platform == 'darwin' && matrix.architecture == 'arm64'
         run: cargo build --release --locked --target ${{ matrix.target }} --features supervisor_ui --features version_check
 
       - name: Build - Cargo (Linux)
@@ -229,13 +229,13 @@ jobs:
           echo "LINUX_X64_SHA=$(sha256sum surfpool-${{ env.SHORT_TARGET_NAME }}.tar.gz | awk '{ print $1 }')" >> "$GITHUB_OUTPUT"
 
       - name: Store SHA256 Hash of Tar (Mac x64)
-        if: matrix.os == 'macos-latest' && matrix.architecture == 'x64'
+        if: matrix.platform == 'darwin' && matrix.architecture == 'x64'
         id: macos_x64_sha
         run: |
           echo "MACOS_X64_SHA=$(shasum -a 256 surfpool-${{ env.SHORT_TARGET_NAME }}.tar.gz | awk '{ print $1 }')" >> "$GITHUB_OUTPUT"
 
       - name: Store SHA256 Hash of Tar (Mac arm64)
-        if: matrix.os == 'macos-latest' && matrix.architecture == 'arm64'
+        if: matrix.platform == 'darwin' && matrix.architecture == 'arm64'
         id: macos_arm64_sha
         run: |
           echo "MACOS_ARM64_SHA=$(shasum -a 256 surfpool-${{ env.SHORT_TARGET_NAME }}.tar.gz | awk '{ print $1 }')" >> "$GITHUB_OUTPUT"

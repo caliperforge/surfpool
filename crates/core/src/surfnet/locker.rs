@@ -1808,7 +1808,9 @@ impl SurfnetSvmLocker {
                     (VersionedMessage::V0(_), None) => {
                         SimpleAddressLoader::Enabled(LoadedAddresses::default())
                     }
-                    (VersionedMessage::Legacy(_), _) => SimpleAddressLoader::Disabled,
+                    (VersionedMessage::Legacy(_) | VersionedMessage::V1(_), _) => {
+                        SimpleAddressLoader::Disabled
+                    }
                 };
 
                 (
@@ -2660,6 +2662,7 @@ impl SurfnetSvmLocker {
                 }
                 acc_keys
             }
+            VersionedMessage::V1(message) => message.account_keys.clone(),
         }
     }
 
@@ -2670,7 +2673,7 @@ impl SurfnetSvmLocker {
         message: &VersionedMessage,
     ) -> SurfpoolResult<Option<TransactionLoadedAddresses>> {
         match message {
-            VersionedMessage::Legacy(_) => Ok(None),
+            VersionedMessage::Legacy(_) | VersionedMessage::V1(_) => Ok(None),
             VersionedMessage::V0(message) => {
                 if message.address_table_lookups.is_empty() {
                     return Ok(None);
@@ -2837,6 +2840,12 @@ impl SurfnetSvmLocker {
                         .map(|l| l.to_address_table_lookups())
                         .unwrap_or_default(),
                 })
+            }
+            VersionedMessage::V1(ref message) => {
+                let mut message = message.clone();
+                message.account_keys = message_accounts[..message.account_keys.len()].to_vec();
+                message.instructions = ixs_for_tx;
+                VersionedMessage::V1(message)
             }
         };
 

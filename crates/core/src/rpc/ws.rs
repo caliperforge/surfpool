@@ -27,7 +27,10 @@ use solana_signature::Signature;
 use solana_transaction_status::{TransactionConfirmationStatus, UiTransactionEncoding};
 
 use super::{State, SurfnetRpcContext, SurfpoolWebsocketMeta};
-use crate::surfnet::{GetTransactionResult, SignatureSubscriptionType};
+use crate::{
+    rpc::utils::MAX_SUPPORTED_TRANSACTION_VERSION,
+    surfnet::{GetTransactionResult, SignatureSubscriptionType},
+};
 
 /// Configuration for account subscription requests.
 ///
@@ -1147,7 +1150,7 @@ impl Rpc for SurfpoolWsRpc {
         let rpc_transaction_config = RpcTransactionConfig {
             encoding: Some(UiTransactionEncoding::Json),
             commitment: config.commitment,
-            max_supported_transaction_version: Some(0),
+            max_supported_transaction_version: Some(MAX_SUPPORTED_TRANSACTION_VERSION),
         };
 
         let subscription_type = if config.enable_received_notification.unwrap_or(false) {

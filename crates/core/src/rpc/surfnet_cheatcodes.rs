@@ -3,7 +3,6 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use jsonrpc_core::{BoxFuture, Error, Result, futures::future};
 use jsonrpc_derive::rpc;
 use solana_account::Account;
@@ -29,7 +28,7 @@ use crate::{
     error::SurfpoolError,
     rpc::{
         State,
-        utils::{verify_pubkey, verify_pubkeys},
+        utils::{decode_and_deserialize, verify_pubkey, verify_pubkeys},
     },
     surfnet::{GetAccountResult, locker::SvmAccessContext},
     types::{TimeTravelConfig, TokenAccount},
@@ -1681,11 +1680,10 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
         config: Option<RpcProfileResultConfig>,
     ) -> BoxFuture<Result<RpcResponse<UiKeyedProfileResult>>> {
         Box::pin(async move {
-            let transaction_bytes = STANDARD
-                .decode(&transaction_data_b64)
-                .map_err(|e| SurfpoolError::invalid_base64_data("transaction", e))?;
-            let transaction: VersionedTransaction = bincode::deserialize(&transaction_bytes)
-                .map_err(|e| SurfpoolError::deserialize_error("transaction", e))?;
+            let (_, transaction) = decode_and_deserialize::<VersionedTransaction>(
+                transaction_data_b64,
+                solana_transaction_status::TransactionBinaryEncoding::Base64,
+            )?;
 
             let SurfnetRpcContext {
                 svm_locker,
@@ -2246,6 +2244,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
     use solana_account_decoder::{
         UiAccountData, UiAccountEncoding, parse_account_data::ParsedAccount,
     };

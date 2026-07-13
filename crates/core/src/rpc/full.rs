@@ -1791,12 +1791,9 @@ impl Full for SurfpoolFullRpc {
             }
 
             let replacement_blockhash = if config.replace_recent_blockhash {
-                match &mut unsanitized_tx.message {
-                    VersionedMessage::Legacy(message) => {
-                        message.recent_blockhash = latest_blockhash
-                    }
-                    VersionedMessage::V0(message) => message.recent_blockhash = latest_blockhash,
-                }
+                unsanitized_tx
+                    .message
+                    .set_recent_blockhash(latest_blockhash);
                 Some(RpcBlockhash {
                     blockhash: latest_blockhash.to_string(),
                     last_valid_block_height: latest_epoch_info.block_height,
@@ -2464,10 +2461,7 @@ impl Full for SurfpoolFullRpc {
                             loaded_addresses.as_ref().map(|l| l.all_loaded_addresses()),
                         );
 
-                        let instructions = match &tx.message {
-                            VersionedMessage::V0(msg) => &msg.instructions,
-                            VersionedMessage::Legacy(msg) => &msg.instructions,
-                        };
+                        let instructions = tx.message.instructions();
 
                         // Find all compute unit prices in the transaction's instructions
                         let compute_unit_prices = instructions
@@ -2559,6 +2553,7 @@ mod tests {
     use solana_keypair::Keypair;
     use solana_message::{
         MessageHeader, legacy::Message as LegacyMessage, v0::Message as V0Message,
+        v1::MAX_TRANSACTION_SIZE,
     };
     use solana_pubkey::Pubkey;
     use solana_signer::Signer;
@@ -3097,12 +3092,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_simulate_transaction_oversized_base64_returns_invalid_params() {
         let setup = TestSetup::new(SurfpoolFullRpc);
+        let oversized_encoded_len = MAX_TRANSACTION_SIZE.div_ceil(3) * 4 + 1;
 
         let err = setup
             .rpc
             .simulate_transaction(
                 Some(setup.context),
-                "A".repeat(1645),
+                "A".repeat(oversized_encoded_len),
                 Some(RpcSimulateTransactionConfig {
                     encoding: Some(UiTransactionEncoding::Base64),
                     ..RpcSimulateTransactionConfig::default()
@@ -3292,14 +3288,7 @@ mod tests {
             ),
             _ => unimplemented!(),
         };
-        match &mut tx.message {
-            VersionedMessage::Legacy(msg) => {
-                msg.recent_blockhash = bad_blockhash;
-            }
-            VersionedMessage::V0(msg) => {
-                msg.recent_blockhash = bad_blockhash;
-            }
-        }
+        tx.message.set_recent_blockhash(bad_blockhash);
 
         let invalid_config = RpcSimulateTransactionConfig {
             sig_verify: true,
@@ -3471,18 +3460,12 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let instructions = match tx.message.clone() {
-            VersionedMessage::Legacy(message) => message
-                .instructions
-                .iter()
-                .map(|ix| UiCompiledInstruction::from(ix, Some(1)))
-                .collect(),
-            VersionedMessage::V0(message) => message
-                .instructions
-                .iter()
-                .map(|ix| UiCompiledInstruction::from(ix, Some(1)))
-                .collect(),
-        };
+        let instructions = tx
+            .message
+            .instructions()
+            .iter()
+            .map(|ix| UiCompiledInstruction::from(ix, Some(1)))
+            .collect();
 
         assert_eq!(
             res,
@@ -3507,7 +3490,9 @@ mod tests {
                             address_table_lookups: match tx.message {
                                 VersionedMessage::Legacy(_) => None,
                                 VersionedMessage::V0(_) => Some(vec![]),
+                                VersionedMessage::V1(_) => None,
                             },
+                            transaction_config: None,
                         })
                     }),
                     meta: res.transaction.clone().meta, // Using the same values to avoid reintroducing processing logic errors

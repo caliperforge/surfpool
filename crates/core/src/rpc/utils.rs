@@ -3,7 +3,6 @@
 use std::any::type_name;
 
 use base64::prelude::*;
-use bincode::Options;
 use jsonrpc_core::{Error, Result};
 use litesvm::types::TransactionMetadata;
 use solana_client::{
@@ -13,7 +12,10 @@ use solana_client::{
 };
 use solana_commitment_config::CommitmentConfig;
 use solana_hash::Hash;
-use solana_message::{AccountKeys, VersionedMessage};
+use solana_message::{
+    AccountKeys, VersionedMessage,
+    v1::{MAX_TRANSACTION_SIZE, V1_PREFIX},
+};
 use solana_packet::PACKET_DATA_SIZE;
 use solana_pubkey::{ParsePubkeyError, Pubkey};
 use solana_signature::Signature;
@@ -119,14 +121,28 @@ fn verify_and_parse_signatures_for_address_params(
     Ok((address, before, until, limit))
 }
 
-const MAX_BASE58_SIZE: usize = 1683; // Golden, bump if PACKET_DATA_SIZE changes
-const MAX_BASE64_SIZE: usize = 1644; // Golden, bump if PACKET_DATA_SIZE changes
+const MAX_BASE58_SIZE: usize = 5594; // Golden, bump if MAX_TRANSACTION_SIZE changes
+const MAX_BASE64_SIZE: usize = 5464; // Golden, bump if MAX_TRANSACTION_SIZE changes
+
+/// Highest transaction version supported by this Surfpool release.
+pub const MAX_SUPPORTED_TRANSACTION_VERSION: u8 = 1;
+
+fn wire_size_limit(wire_output: &[u8]) -> usize {
+    // V1 messages and transactions both start with the V1 message prefix. Legacy and V0
+    // transactions start with their short-vec signature count instead.
+    if wire_output.first().copied() == Some(V1_PREFIX) {
+        MAX_TRANSACTION_SIZE
+    } else {
+        PACKET_DATA_SIZE
+    }
+}
+
 pub fn decode_and_deserialize<T>(
     encoded: String,
     encoding: TransactionBinaryEncoding,
 ) -> Result<(Vec<u8>, T)>
 where
-    T: serde::de::DeserializeOwned,
+    T: wincode::DeserializeOwned<Dst = T>,
 {
     let wire_output = match encoding {
         TransactionBinaryEncoding::Base58 => {
@@ -136,7 +152,7 @@ where
                     type_name::<T>(),
                     encoded.len(),
                     MAX_BASE58_SIZE,
-                    PACKET_DATA_SIZE,
+                    MAX_TRANSACTION_SIZE,
                 )));
             }
             bs58::decode(encoded)
@@ -150,7 +166,7 @@ where
                     type_name::<T>(),
                     encoded.len(),
                     MAX_BASE64_SIZE,
-                    PACKET_DATA_SIZE,
+                    MAX_TRANSACTION_SIZE,
                 )));
             }
             BASE64_STANDARD
@@ -158,19 +174,16 @@ where
                 .map_err(|e| Error::invalid_params(format!("invalid base64 encoding: {e:?}")))?
         }
     };
-    if wire_output.len() > PACKET_DATA_SIZE {
+    let size_limit = wire_size_limit(&wire_output);
+    if wire_output.len() > size_limit {
         return Err(Error::invalid_params(format!(
             "decoded {} too large: {} bytes (max: {} bytes)",
             type_name::<T>(),
             wire_output.len(),
-            PACKET_DATA_SIZE
+            size_limit
         )));
     }
-    bincode::options()
-        .with_limit(PACKET_DATA_SIZE as u64)
-        .with_fixint_encoding()
-        .allow_trailing_bytes()
-        .deserialize_from(&wire_output[..])
+    wincode::deserialize(&wire_output)
         .map_err(|err| {
             Error::invalid_params(format!(
                 "failed to deserialize {}: {}",
@@ -273,7 +286,7 @@ pub fn get_default_transaction_config() -> RpcTransactionConfig {
     RpcTransactionConfig {
         encoding: Some(UiTransactionEncoding::Json),
         commitment: Some(CommitmentConfig::default()),
-        max_supported_transaction_version: Some(0),
+        max_supported_transaction_version: Some(MAX_SUPPORTED_TRANSACTION_VERSION),
     }
 }
 
@@ -282,9 +295,106 @@ pub fn adjust_default_transaction_config(config: &mut RpcTransactionConfig) {
         config.encoding = Some(UiTransactionEncoding::Json);
     }
     if config.max_supported_transaction_version.is_none() {
-        config.max_supported_transaction_version = Some(0);
+        config.max_supported_transaction_version = Some(MAX_SUPPORTED_TRANSACTION_VERSION);
     }
     if config.commitment.is_none() {
         config.commitment = Some(CommitmentConfig::default());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use solana_keypair::Keypair;
+    use solana_message::{MessageHeader, compiled_instruction::CompiledInstruction, v1};
+    use solana_signer::Signer;
+    use solana_transaction::versioned::VersionedTransaction;
+
+    use super::*;
+
+    fn signed_v1_transaction(data_len: usize) -> VersionedTransaction {
+        let payer = Keypair::new();
+        let message = VersionedMessage::V1(v1::Message::new(
+            MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 1,
+            },
+            v1::TransactionConfig::empty(),
+            Hash::default(),
+            vec![payer.pubkey(), Pubkey::new_unique()],
+            vec![CompiledInstruction {
+                program_id_index: 1,
+                accounts: vec![0],
+                data: vec![0; data_len],
+            }],
+        ));
+        let transaction = VersionedTransaction::try_new(message, &[&payer]).unwrap();
+        assert!(
+            transaction.signatures[0]
+                .as_ref()
+                .iter()
+                .any(|byte| *byte != 0)
+        );
+        transaction
+    }
+
+    #[test]
+    fn decodes_signed_v1_transaction_larger_than_legacy_packet() {
+        let transaction = signed_v1_transaction(PACKET_DATA_SIZE);
+        let wire = wincode::serialize(&transaction).unwrap();
+        assert!(wire.len() > PACKET_DATA_SIZE);
+        assert!(wire.len() <= MAX_TRANSACTION_SIZE);
+        assert_eq!(wire[0], V1_PREFIX);
+
+        let encoded = BASE64_STANDARD.encode(&wire);
+        let (_, decoded) = decode_and_deserialize::<VersionedTransaction>(
+            encoded,
+            TransactionBinaryEncoding::Base64,
+        )
+        .unwrap();
+
+        assert_eq!(decoded, transaction);
+    }
+
+    #[test]
+    fn rejects_oversized_v1_and_legacy_wire_payloads() {
+        let mut oversized_v1 = vec![0; MAX_TRANSACTION_SIZE + 1];
+        oversized_v1[0] = V1_PREFIX;
+        let v1_error = decode_and_deserialize::<VersionedTransaction>(
+            BASE64_STANDARD.encode(oversized_v1),
+            TransactionBinaryEncoding::Base64,
+        )
+        .unwrap_err();
+        assert!(v1_error.message.contains("max: 4096 bytes"));
+
+        let oversized_legacy = vec![0; PACKET_DATA_SIZE + 1];
+        let legacy_error = decode_and_deserialize::<VersionedTransaction>(
+            BASE64_STANDARD.encode(oversized_legacy),
+            TransactionBinaryEncoding::Base64,
+        )
+        .unwrap_err();
+        assert!(legacy_error.message.contains("max: 1232 bytes"));
+    }
+
+    #[test]
+    fn worst_case_v1_encoded_size_goldens() {
+        let wire = vec![0xff; MAX_TRANSACTION_SIZE];
+        assert_eq!(bs58::encode(&wire).into_string().len(), MAX_BASE58_SIZE);
+        assert_eq!(BASE64_STANDARD.encode(&wire).len(), MAX_BASE64_SIZE);
+    }
+
+    #[test]
+    fn transaction_config_defaults_support_v1() {
+        assert_eq!(
+            get_default_transaction_config().max_supported_transaction_version,
+            Some(MAX_SUPPORTED_TRANSACTION_VERSION)
+        );
+
+        let mut config = RpcTransactionConfig::default();
+        adjust_default_transaction_config(&mut config);
+        assert_eq!(
+            config.max_supported_transaction_version,
+            Some(MAX_SUPPORTED_TRANSACTION_VERSION)
+        );
     }
 }

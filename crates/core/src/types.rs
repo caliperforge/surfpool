@@ -33,7 +33,9 @@ use solana_transaction_status::{
     TransactionStatusMeta, TransactionTokenBalance, UiAccountsList, UiLoadedAddresses,
     UiTransaction, UiTransactionEncoding, UiTransactionStatusMeta,
     option_serializer::OptionSerializer,
-    parse_accounts::{parse_legacy_message_accounts, parse_v0_message_accounts},
+    parse_accounts::{
+        parse_legacy_message_accounts, parse_v0_message_accounts, parse_v1_message_accounts,
+    },
     parse_ui_inner_instructions,
 };
 use spl_token_2022_interface::extension::{
@@ -243,11 +245,11 @@ impl From<SerializableTransactionStatusMeta> for TransactionStatusMeta {
 }
 
 /// Helper struct for serializing TransactionWithStatusMeta
-/// Note: VersionedTransaction uses bincode internally, so we serialize it as base64-encoded bytes
+/// The transaction is stored as base64-encoded Solana wire bytes.
 #[derive(Serialize, Deserialize)]
 struct SerializableTransactionWithStatusMeta {
     pub slot: u64,
-    /// Base64-encoded bincode serialization of VersionedTransaction
+    /// Base64-encoded wire serialization of VersionedTransaction.
     pub transaction_bytes: String,
     pub meta: SerializableTransactionStatusMeta,
 }
@@ -290,9 +292,8 @@ impl Serialize for TransactionWithStatusMeta {
     where
         S: Serializer,
     {
-        // Serialize VersionedTransaction using bincode, then base64 encode
-        let tx_bytes = bincode::serialize(&self.transaction)
-            .map_err(|e| serde::ser::Error::custom(format!("bincode error: {}", e)))?;
+        let tx_bytes = wincode::serialize(&self.transaction)
+            .map_err(|e| serde::ser::Error::custom(format!("wincode error: {}", e)))?;
         let tx_base64 = BASE64_STANDARD.encode(&tx_bytes);
 
         let helper = SerializableTransactionWithStatusMeta {
@@ -311,18 +312,77 @@ impl<'de> Deserialize<'de> for TransactionWithStatusMeta {
     {
         let helper = SerializableTransactionWithStatusMeta::deserialize(deserializer)?;
 
-        // Decode base64 and deserialize using bincode
         let tx_bytes = BASE64_STANDARD
             .decode(&helper.transaction_bytes)
             .map_err(|e| serde::de::Error::custom(format!("base64 decode error: {}", e)))?;
-        let transaction: VersionedTransaction = bincode::deserialize(&tx_bytes)
-            .map_err(|e| serde::de::Error::custom(format!("bincode deserialize error: {}", e)))?;
+        let transaction: VersionedTransaction = wincode::deserialize(&tx_bytes)
+            .map_err(|e| serde::de::Error::custom(format!("wincode deserialize error: {}", e)))?;
 
         Ok(Self {
             slot: helper.slot,
             transaction,
             meta: helper.meta.into(),
         })
+    }
+}
+
+#[cfg(test)]
+mod transaction_with_status_meta_tests {
+    use solana_message::{MessageHeader, v0, v1};
+    use solana_signature::Signature;
+
+    use super::*;
+
+    #[test]
+    fn persists_v1_transaction_wire_format() {
+        let transaction = VersionedTransaction {
+            signatures: vec![Signature::default()],
+            message: VersionedMessage::V1(v1::Message::new(
+                MessageHeader {
+                    num_required_signatures: 1,
+                    ..MessageHeader::default()
+                },
+                v1::TransactionConfig::empty(),
+                Hash::default(),
+                vec![Pubkey::new_unique()],
+                vec![],
+            )),
+        };
+        let stored = TransactionWithStatusMeta {
+            transaction: transaction.clone(),
+            ..TransactionWithStatusMeta::default()
+        };
+
+        let json = serde_json::to_string(&stored).unwrap();
+        let restored: TransactionWithStatusMeta = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.transaction, transaction);
+    }
+
+    #[test]
+    fn reads_legacy_and_v0_bincode_persistence() {
+        let transactions = [
+            VersionedTransaction::default(),
+            VersionedTransaction {
+                signatures: vec![],
+                message: VersionedMessage::V0(v0::Message::default()),
+            },
+        ];
+
+        for transaction in transactions {
+            let helper = SerializableTransactionWithStatusMeta {
+                slot: 42,
+                transaction_bytes: BASE64_STANDARD
+                    .encode(bincode::serialize(&transaction).unwrap()),
+                meta: TransactionStatusMeta::default().into(),
+            };
+
+            let json = serde_json::to_string(&helper).unwrap();
+            let restored: TransactionWithStatusMeta = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(restored.slot, 42);
+            assert_eq!(restored.transaction, transaction);
+        }
     }
 }
 
@@ -456,14 +516,14 @@ impl TransactionWithStatusMeta {
         Ok(EncodedTransactionWithStatusMeta {
             transaction: match encoding {
                 UiTransactionEncoding::Binary => EncodedTransaction::LegacyBinary(
-                    bs58::encode(bincode::serialize(&self.transaction).unwrap()).into_string(),
+                    bs58::encode(wincode::serialize(&self.transaction).unwrap()).into_string(),
                 ),
                 UiTransactionEncoding::Base58 => EncodedTransaction::Binary(
-                    bs58::encode(bincode::serialize(&self.transaction).unwrap()).into_string(),
+                    bs58::encode(wincode::serialize(&self.transaction).unwrap()).into_string(),
                     TransactionBinaryEncoding::Base58,
                 ),
                 UiTransactionEncoding::Base64 => EncodedTransaction::Binary(
-                    BASE64_STANDARD.encode(bincode::serialize(&self.transaction).unwrap()),
+                    BASE64_STANDARD.encode(wincode::serialize(&self.transaction).unwrap()),
                     TransactionBinaryEncoding::Base64,
                 ),
                 UiTransactionEncoding::Json => EncodedTransaction::Json(UiTransaction {
@@ -478,6 +538,9 @@ impl TransactionWithStatusMeta {
                             message.encode(UiTransactionEncoding::Json)
                         }
                         VersionedMessage::V0(message) => message.json_encode(),
+                        VersionedMessage::V1(message) => {
+                            message.encode(UiTransactionEncoding::Json)
+                        }
                     },
                 }),
                 UiTransactionEncoding::JsonParsed => EncodedTransaction::Json(UiTransaction {
@@ -493,6 +556,9 @@ impl TransactionWithStatusMeta {
                         }
                         VersionedMessage::V0(message) => {
                             message.encode_with_meta(UiTransactionEncoding::JsonParsed, &self.meta)
+                        }
+                        VersionedMessage::V1(message) => {
+                            message.encode(UiTransactionEncoding::JsonParsed)
                         }
                     },
                 }),
@@ -535,6 +601,7 @@ impl TransactionWithStatusMeta {
                 );
                 parse_v0_message_accounts(&loaded_message)
             }
+            VersionedMessage::V1(message) => parse_v1_message_accounts(message),
         };
 
         Ok(EncodedTransactionWithStatusMeta {

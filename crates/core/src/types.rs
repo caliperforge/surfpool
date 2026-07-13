@@ -328,8 +328,11 @@ impl<'de> Deserialize<'de> for TransactionWithStatusMeta {
 
 #[cfg(test)]
 mod transaction_with_status_meta_tests {
-    use solana_message::{MessageHeader, v0, v1};
+    use solana_keypair::Keypair;
+    use solana_message::{MessageHeader, legacy, v0, v1};
     use solana_signature::Signature;
+    use solana_signer::Signer;
+    use solana_system_interface::instruction::transfer;
 
     use super::*;
 
@@ -361,12 +364,47 @@ mod transaction_with_status_meta_tests {
 
     #[test]
     fn reads_legacy_and_v0_bincode_persistence() {
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let recent_blockhash = Hash::new_unique();
+        let transfer_instruction = transfer(&payer.pubkey(), &recipient, 1);
+        let signed_legacy = VersionedTransaction::try_new(
+            VersionedMessage::Legacy(legacy::Message::new_with_blockhash(
+                &[transfer_instruction.clone()],
+                Some(&payer.pubkey()),
+                &recent_blockhash,
+            )),
+            &[&payer],
+        )
+        .unwrap();
+        let signed_v0 = VersionedTransaction::try_new(
+            VersionedMessage::V0(
+                v0::Message::try_compile(
+                    &payer.pubkey(),
+                    &[transfer_instruction],
+                    &[],
+                    recent_blockhash,
+                )
+                .unwrap(),
+            ),
+            &[&payer],
+        )
+        .unwrap();
+
+        for transaction in [&signed_legacy, &signed_v0] {
+            assert_ne!(transaction.signatures[0], Signature::default());
+            assert!(!transaction.message.static_account_keys().is_empty());
+            assert!(!transaction.message.instructions().is_empty());
+        }
+
         let transactions = [
             VersionedTransaction::default(),
             VersionedTransaction {
                 signatures: vec![],
                 message: VersionedMessage::V0(v0::Message::default()),
             },
+            signed_legacy,
+            signed_v0,
         ];
 
         for transaction in transactions {

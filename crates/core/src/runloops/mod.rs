@@ -370,6 +370,9 @@ pub async fn start_block_production_runloop(
                         }
                     }
                     ClockEvent::ExpireBlockHash => {
+                        let _ = svm_locker
+                            .simnet_events_tx()
+                            .send(SimnetEvent::BlockHashExpired);
                         do_produce_block = true;
                     }
                 }

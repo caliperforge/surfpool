@@ -346,6 +346,7 @@ pub async fn start_block_production_runloop(
     let ix_profiling_initially_enabled = simnet_config.instruction_profiling_enabled;
     loop {
         let mut do_produce_block = false;
+        let mut blockhash_expired = false;
 
         select! {
             recv(clock_event_rx) -> msg => if let Ok(event) = msg {
@@ -370,10 +371,8 @@ pub async fn start_block_production_runloop(
                         }
                     }
                     ClockEvent::ExpireBlockHash => {
-                        let _ = svm_locker
-                            .simnet_events_tx()
-                            .send(SimnetEvent::BlockHashExpired);
                         do_produce_block = true;
+                        blockhash_expired = true;
                     }
                 }
             },
@@ -535,6 +534,11 @@ pub async fn start_block_production_runloop(
                 svm_locker
                     .confirm_current_block(&remote_client_with_commitment)
                     .await?;
+                if blockhash_expired {
+                    let _ = svm_locker
+                        .simnet_events_tx()
+                        .send(SimnetEvent::BlockHashExpired);
+                }
             }
         }
     }

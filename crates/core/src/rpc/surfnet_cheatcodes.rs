@@ -5354,10 +5354,13 @@ mod tests {
 
         let balance = result.available.expect("available balance should decrypt");
         assert_eq!(balance, 10);
+        // Shape check, not a decryption check: the setter writes an all-zero pending
+        // ciphertext, which is the identity point and decodes to 0 under any key. The
+        // decrypt path is covered by test_confidential_pending_balance_recombines_lo_and_hi.
         assert_eq!(
             result.pending,
             Some(0),
-            "a freshly configured account has nothing pending"
+            "pending should be present when an elgamalSecretKey is supplied"
         );
         assert_eq!(result.pending_balance_credit_counter, 0);
     }
@@ -5423,6 +5426,25 @@ mod tests {
         assert_eq!(
             balance.available, None,
             "available should be absent when no aesKey is supplied"
+        );
+
+        // A foreign ElGamal secret key must fail rather than decrypt to some other
+        // number. This only holds against a non-zero pending balance: the all-zero
+        // ciphertext a freshly configured account carries is the identity point and
+        // decodes to 0 under any key.
+        let foreign = ElGamalKeypair::new_rand();
+        assert!(
+            decrypt_confidential_balances(
+                &account_data,
+                &ConfidentialBalanceKeys {
+                    aes_key: None,
+                    elgamal_secret_key: Some(
+                        bs58::encode(<[u8; 32]>::from(foreign.secret())).into_string(),
+                    ),
+                },
+            )
+            .is_err(),
+            "a foreign elgamalSecretKey should fail rather than decrypt"
         );
     }
 

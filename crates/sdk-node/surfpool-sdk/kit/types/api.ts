@@ -4,7 +4,10 @@ import type {
     AccountSnapshot,
     AccountUpdate,
     CheatcodeControlConfig,
+    ConfidentialBalanceKeys,
+    DeriveConfidentialKeysResponse,
     ExportSnapshotConfig,
+    GetConfidentialBalanceResponse,
     GetStreamedAccountsResponse,
     GetSurfnetInfoResponse,
     OfflineAccountConfig,
@@ -111,6 +114,12 @@ export type SurfnetSetAccountApi = {
 export type SurfnetSetTokenAccountApi = {
     setTokenAccount(owner: Address, mint: Address, update: TokenAccountUpdate, tokenProgram?: Address): null;
 };
+export type SurfnetGetConfidentialBalanceApi = {
+    getConfidentialBalance(tokenAccount: Address, keys: ConfidentialBalanceKeys): GetConfidentialBalanceResponse;
+};
+export type SurfnetDeriveConfidentialKeysApi = {
+    deriveConfidentialKeys(keypair: string, tokenAccount: Address): DeriveConfidentialKeysResponse;
+};
 export type SurfnetResetAccountApi = {
     resetAccount(pubkey: Address, config?: ResetAccountConfig): null;
 };
@@ -188,10 +197,12 @@ export type SurfnetGetLocalSignaturesApi = {
  * (it is re-added on the wire by the request transformer).
  */
 export type SurfnetCheatcodesApi = SurfnetCloneProgramAccountApi &
+    SurfnetDeriveConfidentialKeysApi &
     SurfnetDisableCheatcodeApi &
     SurfnetEnableCheatcodeApi &
     SurfnetExportSnapshotApi &
     SurfnetGetActiveIdlApi &
+    SurfnetGetConfidentialBalanceApi &
     SurfnetGetLocalSignaturesApi &
     SurfnetGetProfileResultsByTagApi &
     SurfnetGetStreamedAccountsApi &

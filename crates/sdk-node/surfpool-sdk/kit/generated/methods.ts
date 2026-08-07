@@ -2,10 +2,12 @@
 // Do not edit; run `npm run generate:kit-types` in crates/sdk-node instead.
 export const SURFNET_CHEATCODE_METHODS = [
   "surfnet_cloneProgramAccount",
+  "surfnet_deriveConfidentialKeys",
   "surfnet_disableCheatcode",
   "surfnet_enableCheatcode",
   "surfnet_exportSnapshot",
   "surfnet_getActiveIdl",
+  "surfnet_getConfidentialBalance",
   "surfnet_getLocalSignatures",
   "surfnet_getProfileResultsByTag",
   "surfnet_getStreamedAccounts",

@@ -13,6 +13,7 @@ use solana_account_decoder::{
 };
 use solana_clock::{Epoch, Slot};
 use solana_hash::Hash;
+use solana_keypair::Keypair;
 use solana_message::{
     AccountKeys, VersionedMessage,
     v0::{LoadedAddresses, LoadedMessage, MessageAddressTableLookup},
@@ -41,21 +42,26 @@ use solana_transaction_status::{
 use spl_token_2022_interface::{
     extension::{
         BaseStateWithExtensions, BaseStateWithExtensionsMut, ExtensionType, StateWithExtensions,
-        StateWithExtensionsMut, confidential_transfer::ConfidentialTransferAccount,
+        StateWithExtensionsMut,
+        confidential_transfer::{ConfidentialTransferAccount, PENDING_BALANCE_LO_BIT_LENGTH},
         confidential_transfer_fee::ConfidentialTransferFeeAmount,
-        interest_bearing_mint::InterestBearingConfig, scaled_ui_amount::ScaledUiAmountConfig,
+        interest_bearing_mint::InterestBearingConfig,
+        scaled_ui_amount::ScaledUiAmountConfig,
         transfer_fee::TransferFeeConfig,
     },
     solana_zk_sdk::encryption::{
-        auth_encryption::AeKey,
-        elgamal::ElGamalPubkey,
+        auth_encryption::{AeCiphertext, AeKey},
+        elgamal::{ElGamalCiphertext, ElGamalKeypair, ElGamalPubkey, ElGamalSecretKey},
         pod::{
             auth_encryption::PodAeCiphertext,
             elgamal::{PodElGamalCiphertext, PodElGamalPubkey},
         },
     },
 };
-use surfpool_types::types::ConfidentialTransferAccountUpdate;
+use surfpool_types::types::{
+    ConfidentialBalanceKeys, ConfidentialTransferAccountUpdate, DeriveConfidentialKeysResponse,
+    GetConfidentialBalanceResponse,
+};
 use txtx_addon_kit::indexmap::IndexMap;
 
 use crate::{
@@ -1337,6 +1343,118 @@ pub fn build_confidential_token_account_data(
 
     drop(state);
     Ok(buffer)
+}
+
+/// Decrypt the confidential balances held on a Token-2022 token account.
+///
+/// Backs the `surfnet_getConfidentialBalance` cheatcode, the read half of the
+/// confidential test loop whose write half is `surfnet_setTokenAccount`. Each
+/// balance has its own key because the extension stores them differently:
+/// - **available** is read from `decryptable_available_balance`, the AES copy the
+///   program maintains for the owner. The authoritative `available_balance` is an
+///   ElGamal ciphertext over a full u64 and is not recoverable by the u32
+///   discrete-log decode, so the AES copy is the only read path.
+/// - **pending** is read from the `lo`/`hi` ElGamal ciphertexts, each within the
+///   u32 decode range, and recombined.
+pub fn decrypt_confidential_balances(
+    account_data: &[u8],
+    keys: &ConfidentialBalanceKeys,
+) -> Result<GetConfidentialBalanceResponse, String> {
+    let state =
+        StateWithExtensions::<spl_token_2022_interface::state::Account>::unpack(account_data)
+            .map_err(|e| format!("not a Token-2022 token account: {e}"))?;
+    let ext = state
+        .get_extension::<ConfidentialTransferAccount>()
+        .map_err(|e| format!("account has no confidential-transfer extension: {e}"))?;
+
+    let available = match keys.aes_key.as_deref() {
+        Some(aes_key) => {
+            let bytes = decode_confidential_key(aes_key, 16).map_err(|e| format!("aesKey: {e}"))?;
+            let key = AeKey::try_from(bytes.as_slice())
+                .map_err(|e| format!("aesKey: invalid AES key ({e})"))?;
+            let ciphertext = AeCiphertext::try_from(ext.decryptable_available_balance)
+                .map_err(|e| format!("available balance is not a valid AES ciphertext: {e}"))?;
+            Some(key.decrypt(&ciphertext).ok_or_else(|| {
+                "aesKey does not decrypt this account's available balance".to_string()
+            })?)
+        }
+        None => None,
+    };
+
+    let pending = match keys.elgamal_secret_key.as_deref() {
+        Some(secret_key) => {
+            let bytes = decode_confidential_key(secret_key, 32)
+                .map_err(|e| format!("elgamalSecretKey: {e}"))?;
+            let secret = ElGamalSecretKey::try_from(bytes.as_slice())
+                .map_err(|e| format!("elgamalSecretKey: invalid ElGamal secret key ({e})"))?;
+            let lo = decrypt_pending_balance(ext.pending_balance_lo, &secret, "lo")?;
+            let hi = decrypt_pending_balance(ext.pending_balance_hi, &secret, "hi")?;
+            Some(
+                hi.checked_shl(PENDING_BALANCE_LO_BIT_LENGTH)
+                    .and_then(|hi| hi.checked_add(lo))
+                    .ok_or_else(|| "pending balance overflows u64".to_string())?,
+            )
+        }
+        None => None,
+    };
+
+    Ok(GetConfidentialBalanceResponse {
+        available,
+        pending,
+        pending_balance_credit_counter: ext.pending_balance_credit_counter.into(),
+    })
+}
+
+fn decrypt_pending_balance(
+    ciphertext: PodElGamalCiphertext,
+    secret: &ElGamalSecretKey,
+    half: &str,
+) -> Result<u64, String> {
+    let ciphertext = ElGamalCiphertext::try_from(ciphertext)
+        .map_err(|e| format!("pending balance {half} is not a valid ElGamal ciphertext: {e}"))?;
+    secret.decrypt_u32(&ciphertext).ok_or_else(|| {
+        format!("elgamalSecretKey does not decrypt this account's pending balance {half}")
+    })
+}
+
+/// The per-token-account public seed the confidential keys are derived over. The
+/// signature of this seed — not the wallet's private key, which hardware signers
+/// never expose — is what the key derivation is hashed from.
+const CONFIDENTIAL_KEY_SEED_PREFIX: &[u8] = b"solana-conf-bal/v1";
+
+/// Derive an owner's confidential-transfer keys for a token account.
+///
+/// Backs the `surfnet_deriveConfidentialKeys` cheatcode. Doing this server-side is
+/// what lets the confidential cheatcodes be used with no client-side crypto
+/// dependency at all: the caller hands over the keypair its test already holds and
+/// gets back the exact keys a confidential client would have derived, ready to pass
+/// to `surfnet_setTokenAccount` and `surfnet_getConfidentialBalance`.
+///
+/// The ElGamal and AES keys are derived from signatures over two different messages,
+/// so this takes the keypair rather than a single pre-computed signature.
+pub fn derive_confidential_keys(
+    keypair: &str,
+    token_account: &Pubkey,
+) -> Result<DeriveConfidentialKeysResponse, String> {
+    let keypair_bytes =
+        decode_confidential_key(keypair, 64).map_err(|e| format!("keypair: {e}"))?;
+    let keypair = Keypair::try_from(keypair_bytes.as_slice())
+        .map_err(|e| format!("keypair: invalid Solana keypair ({e})"))?;
+
+    let public_seed = [CONFIDENTIAL_KEY_SEED_PREFIX, token_account.as_ref()].concat();
+    let elgamal = ElGamalKeypair::new_from_signer(&keypair, &public_seed)
+        .map_err(|e| format!("failed to derive ElGamal keypair: {e}"))?;
+    let aes_key = AeKey::new_from_signer(&keypair, &public_seed)
+        .map_err(|e| format!("failed to derive AES key: {e}"))?;
+
+    let elgamal_secret_key: [u8; 32] = elgamal.secret().into();
+    let aes_key: [u8; 16] = aes_key.into();
+    Ok(DeriveConfidentialKeysResponse {
+        elgamal_pubkey: bs58::encode(bytes_of(&PodElGamalPubkey::from(elgamal.pubkey_owned())))
+            .into_string(),
+        elgamal_secret_key: bs58::encode(elgamal_secret_key).into_string(),
+        aes_key: bs58::encode(aes_key).into_string(),
+    })
 }
 
 impl_token_program_packable_serde!(

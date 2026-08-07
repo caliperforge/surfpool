@@ -20,7 +20,11 @@ use surfpool_types::{
     GetStreamedAccountsResponse, GetSurfnetInfoResponse, Idl, OfflineAccountConfig,
     ResetAccountConfig, RpcProfileResultConfig, Scenario, SimnetCommand, StreamAccountConfig,
     StreamAccountsEntry, UiKeyedProfileResult,
-    types::{AccountUpdate, SetSomeAccount, SupplyUpdate, TokenAccountUpdate, UuidOrSignature},
+    types::{
+        AccountUpdate, ConfidentialBalanceKeys, DeriveConfidentialKeysResponse,
+        GetConfidentialBalanceResponse, SetSomeAccount, SupplyUpdate, TokenAccountUpdate,
+        UuidOrSignature,
+    },
 };
 
 use super::{RunloopContext, SurfnetRpcContext};
@@ -33,7 +37,7 @@ use crate::{
     surfnet::{GetAccountResult, locker::SvmAccessContext},
     types::{
         TimeTravelConfig, TokenAccount, build_confidential_token_account_data,
-        mint_has_transfer_fee_config,
+        decrypt_confidential_balances, derive_confidential_keys, mint_has_transfer_fee_config,
     },
 };
 
@@ -1213,6 +1217,133 @@ pub trait SurfnetCheatcodes {
     fn get_surfnet_info(&self, meta: Self::Metadata)
     -> Result<RpcResponse<GetSurfnetInfoResponse>>;
 
+    /// A cheat code to read the decrypted confidential-transfer balances of a Token-2022 token account.
+    ///
+    /// This is the read counterpart to `surfnet_setTokenAccount`'s `confidential` field: with both,
+    /// a confidential-transfer test can set a balance up, act on it, and assert on the result without
+    /// hand-rolling ElGamal/AES decryption client-side.
+    ///
+    /// ## Parameters
+    /// - `token_account`: The base-58 encoded address of the token account to read.
+    /// - `keys`: The owner's confidential secrets. At least one is required:
+    ///   - `aesKey` (base58/base64, 16 bytes): decrypts the available balance.
+    ///   - `elgamalSecretKey` (base58/base64, 32 bytes): decrypts the pending balance. This is the
+    ///     ElGamal *secret* key, not the public key stored on the account.
+    ///
+    ///   `surfnet_deriveConfidentialKeys` returns both in the expected form.
+    ///
+    /// ## Returns
+    /// A `RpcResponse<GetConfidentialBalanceResponse>` with the decrypted `available` and `pending`
+    /// amounts (each `null` when the corresponding key was not supplied), plus the account's
+    /// `pendingBalanceCreditCounter` — non-zero means an `ApplyPendingBalance` is still needed
+    /// before the pending amount shows up in `available`.
+    ///
+    /// ## Example Request
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "id": 1,
+    ///   "method": "surfnet_getConfidentialBalance",
+    ///   "params": [
+    ///     "4EXSeLGxVBpAZwq7vm6evLdewpcvE2H56fpqL2pPiLFa",
+    ///     {
+    ///       "aesKey": "<base58, 16 bytes>",
+    ///       "elgamalSecretKey": "<base58, 32 bytes>"
+    ///     }
+    ///   ]
+    /// }
+    /// ```
+    ///
+    /// ## Example Response
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "result": {
+    ///     "context": {
+    ///       "slot": 123456789,
+    ///       "apiVersion": "2.3.8"
+    ///     },
+    ///     "value": {
+    ///       "available": 10,
+    ///       "pending": 0,
+    ///       "pendingBalanceCreditCounter": 0
+    ///     }
+    ///   },
+    ///   "id": 1
+    /// }
+    /// ```
+    ///
+    /// # Notes
+    /// Requires the Token-2022 program and an account carrying the confidential-transfer extension.
+    #[rpc(meta, name = "surfnet_getConfidentialBalance")]
+    fn get_confidential_balance(
+        &self,
+        meta: Self::Metadata,
+        token_account: String,
+        keys: ConfidentialBalanceKeys,
+    ) -> BoxFuture<Result<RpcResponse<GetConfidentialBalanceResponse>>>;
+
+    /// A cheat code to derive an owner's confidential-transfer keys for a token account.
+    ///
+    /// The confidential cheatcodes take an `elgamalPubkey` and an `aesKey`, which a client would
+    /// normally derive with an external confidential-transfer SDK. Deriving them here lets a test
+    /// drive the whole confidential suite with no client-side crypto dependency.
+    ///
+    /// ## Parameters
+    /// - `keypair`: The owner's 64-byte Solana keypair, base58 or base64 encoded.
+    /// - `token_account`: The base-58 encoded address of the token account the keys are for. Keys are
+    ///   derived per token account, so this must be the same address later passed to
+    ///   `surfnet_getConfidentialBalance`.
+    ///
+    /// ## Returns
+    /// A `RpcResponse<DeriveConfidentialKeysResponse>` with base58 `elgamalPubkey` (for
+    /// `surfnet_setTokenAccount`), `elgamalSecretKey` (for `surfnet_getConfidentialBalance`), and
+    /// `aesKey` (for both).
+    ///
+    /// ## Example Request
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "id": 1,
+    ///   "method": "surfnet_deriveConfidentialKeys",
+    ///   "params": [
+    ///     "<base58, 64-byte keypair>",
+    ///     "4EXSeLGxVBpAZwq7vm6evLdewpcvE2H56fpqL2pPiLFa"
+    ///   ]
+    /// }
+    /// ```
+    ///
+    /// ## Example Response
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "result": {
+    ///     "context": {
+    ///       "slot": 123456789,
+    ///       "apiVersion": "2.3.8"
+    ///     },
+    ///     "value": {
+    ///       "elgamalPubkey": "<base58, 32 bytes>",
+    ///       "elgamalSecretKey": "<base58, 32 bytes>",
+    ///       "aesKey": "<base58, 16 bytes>"
+    ///     }
+    ///   },
+    ///   "id": 1
+    /// }
+    /// ```
+    ///
+    /// # Notes
+    /// The derivation matches what a confidential-transfer client computes from the same keypair, so
+    /// keys produced here interoperate with keys derived off-chain. The keypair is used only to sign
+    /// the derivation seeds; it is not stored.
+    #[rpc(meta, name = "surfnet_deriveConfidentialKeys")]
+    fn derive_confidential_keys(
+        &self,
+        meta: Self::Metadata,
+        keypair: String,
+        token_account: String,
+    ) -> Result<RpcResponse<DeriveConfidentialKeysResponse>>;
+
     /// A "cheat code" method for developers to write program data at a specified offset in Surfpool.
     ///
     /// This method allows developers to write large Solana programs by sending data in chunks,
@@ -2233,6 +2364,75 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
         Ok(RpcResponse {
             context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
             value,
+        })
+    }
+
+    fn get_confidential_balance(
+        &self,
+        meta: Self::Metadata,
+        token_account_str: String,
+        keys: ConfidentialBalanceKeys,
+    ) -> BoxFuture<Result<RpcResponse<GetConfidentialBalanceResponse>>> {
+        let token_account = match verify_pubkey(&token_account_str) {
+            Ok(res) => res,
+            Err(e) => return e.into(),
+        };
+
+        if keys.aes_key.is_none() && keys.elgamal_secret_key.is_none() {
+            return Box::pin(future::err(Error::invalid_params(
+                "at least one of aesKey (available balance) or elgamalSecretKey (pending balance) is required".to_string(),
+            )));
+        }
+
+        let SurfnetRpcContext {
+            svm_locker,
+            remote_ctx,
+        } = match meta.get_rpc_context(CommitmentConfig::confirmed()) {
+            Ok(res) => res,
+            Err(e) => return e.into(),
+        };
+
+        Box::pin(async move {
+            let SvmAccessContext {
+                slot,
+                inner: account_result,
+                ..
+            } = svm_locker
+                .get_account(&remote_ctx, &token_account, None)
+                .await?;
+            svm_locker.write_account_update(account_result.clone());
+
+            let account = account_result.map_account()?;
+            if account.owner != spl_token_2022_interface::id() {
+                return Err(Error::invalid_params(format!(
+                    "{token_account} is not owned by the Token-2022 program (owner: {})",
+                    account.owner
+                )));
+            }
+
+            let balance = decrypt_confidential_balances(&account.data, &keys)
+                .map_err(Error::invalid_params)?;
+
+            Ok(RpcResponse {
+                context: RpcResponseContext::new(slot),
+                value: balance,
+            })
+        })
+    }
+
+    fn derive_confidential_keys(
+        &self,
+        meta: Self::Metadata,
+        keypair: String,
+        token_account_str: String,
+    ) -> Result<RpcResponse<DeriveConfidentialKeysResponse>> {
+        let token_account = verify_pubkey(&token_account_str)?;
+        let svm_locker = meta.get_svm_locker()?;
+        let keys =
+            derive_confidential_keys(&keypair, &token_account).map_err(Error::invalid_params)?;
+        Ok(RpcResponse {
+            context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
+            value: keys,
         })
     }
 
@@ -5089,6 +5289,249 @@ mod tests {
             ae_key.decrypt(&ae_ct),
             Some(0),
             "receive-only account's decryptable balance should decrypt to 0"
+        );
+    }
+
+    /// The whole point of the pair: derive keys, set a confidential balance, read it
+    /// back — with no client-side crypto anywhere in the test.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_confidential_balance_round_trip() {
+        use surfpool_types::types::ConfidentialTransferAccountUpdate;
+
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let owner = Keypair::new();
+        let mint = Keypair::new();
+        let token_program = spl_token_2022_interface::id();
+        let token_account = get_associated_token_address_with_program_id(
+            &owner.pubkey(),
+            &mint.pubkey(),
+            &token_program,
+        );
+
+        let keys = client
+            .rpc
+            .derive_confidential_keys(
+                Some(client.context.clone()),
+                bs58::encode(owner.to_bytes()).into_string(),
+                token_account.to_string(),
+            )
+            .expect("key derivation should succeed")
+            .value;
+
+        client
+            .rpc
+            .set_token_account(
+                Some(client.context.clone()),
+                owner.pubkey().to_string(),
+                mint.pubkey().to_string(),
+                TokenAccountUpdate {
+                    confidential: Some(ConfidentialTransferAccountUpdate {
+                        elgamal_pubkey: keys.elgamal_pubkey.clone(),
+                        aes_key: Some(keys.aes_key.clone()),
+                        amount: Some(10),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                Some(token_program.to_string()),
+            )
+            .await
+            .expect("set_token_account should succeed");
+
+        let result = client
+            .rpc
+            .get_confidential_balance(
+                Some(client.context.clone()),
+                token_account.to_string(),
+                ConfidentialBalanceKeys {
+                    aes_key: Some(keys.aes_key),
+                    elgamal_secret_key: Some(keys.elgamal_secret_key),
+                },
+            )
+            .await
+            .expect("get_confidential_balance should succeed")
+            .value;
+
+        let balance = result.available.expect("available balance should decrypt");
+        assert_eq!(balance, 10);
+        assert_eq!(
+            result.pending,
+            Some(0),
+            "a freshly configured account has nothing pending"
+        );
+        assert_eq!(result.pending_balance_credit_counter, 0);
+    }
+
+    /// The pending balance is split across two ciphertexts to keep each within the
+    /// u32 discrete-log decode range, so the recombination is only exercised by a
+    /// value that spans both halves.
+    #[test]
+    fn test_confidential_pending_balance_recombines_lo_and_hi() {
+        use bytemuck::bytes_of;
+        use spl_token_2022_interface::{
+            extension::{
+                BaseStateWithExtensionsMut, StateWithExtensionsMut,
+                confidential_transfer::ConfidentialTransferAccount,
+            },
+            solana_zk_sdk::encryption::{elgamal::ElGamalKeypair, pod::elgamal::PodElGamalPubkey},
+        };
+        use surfpool_types::types::ConfidentialTransferAccountUpdate;
+
+        let elgamal = ElGamalKeypair::new_rand();
+        let aes_key = [3u8; 16];
+        let mut account_data = build_confidential_token_account_data(
+            &spl_token_2022_interface::state::Account {
+                state: spl_token_2022_interface::state::AccountState::Initialized,
+                ..Default::default()
+            },
+            false,
+            &ConfidentialTransferAccountUpdate {
+                elgamal_pubkey: bs58::encode(bytes_of(&PodElGamalPubkey::from(
+                    elgamal.pubkey_owned(),
+                )))
+                .into_string(),
+                aes_key: Some(bs58::encode(aes_key).into_string()),
+                ..Default::default()
+            },
+        )
+        .expect("confidential account should build");
+
+        // 70_000 = 4_464 in the low 16 bits + 1 in the high half.
+        let (pending_lo, pending_hi) = (4_464u64, 1u64);
+        let mut state = StateWithExtensionsMut::<spl_token_2022_interface::state::Account>::unpack(
+            &mut account_data,
+        )
+        .expect("account should unpack");
+        let ext = state
+            .get_extension_mut::<ConfidentialTransferAccount>()
+            .expect("confidential extension should be present");
+        ext.pending_balance_lo = elgamal.pubkey().encrypt_u64(pending_lo).into();
+        ext.pending_balance_hi = elgamal.pubkey().encrypt_u64(pending_hi).into();
+
+        let balance = decrypt_confidential_balances(
+            &account_data,
+            &ConfidentialBalanceKeys {
+                aes_key: None,
+                elgamal_secret_key: Some(
+                    bs58::encode(<[u8; 32]>::from(elgamal.secret())).into_string(),
+                ),
+            },
+        )
+        .expect("pending balance should decrypt");
+
+        assert_eq!(balance.pending, Some(70_000));
+        assert_eq!(
+            balance.available, None,
+            "available should be absent when no aesKey is supplied"
+        );
+    }
+
+    /// Keys are scoped to a token account, so the same wallet gets different keys per
+    /// account — and the same ones every time for a given account.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_derive_confidential_keys_are_deterministic_and_account_scoped() {
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let owner = bs58::encode(Keypair::new().to_bytes()).into_string();
+        let token_account = Pubkey::new_unique();
+
+        let derive = |token_account: Pubkey| {
+            client
+                .rpc
+                .derive_confidential_keys(
+                    Some(client.context.clone()),
+                    owner.clone(),
+                    token_account.to_string(),
+                )
+                .expect("key derivation should succeed")
+                .value
+        };
+
+        assert_eq!(derive(token_account), derive(token_account));
+        assert_ne!(derive(token_account), derive(Pubkey::new_unique()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_confidential_balance_rejects_bad_input() {
+        use surfpool_types::types::ConfidentialTransferAccountUpdate;
+
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let owner = Keypair::new();
+        let mint = Keypair::new();
+        let token_program = spl_token_2022_interface::id();
+        let token_account = get_associated_token_address_with_program_id(
+            &owner.pubkey(),
+            &mint.pubkey(),
+            &token_program,
+        );
+
+        let keys = client
+            .rpc
+            .derive_confidential_keys(
+                Some(client.context.clone()),
+                bs58::encode(owner.to_bytes()).into_string(),
+                token_account.to_string(),
+            )
+            .expect("key derivation should succeed")
+            .value;
+
+        client
+            .rpc
+            .set_token_account(
+                Some(client.context.clone()),
+                owner.pubkey().to_string(),
+                mint.pubkey().to_string(),
+                TokenAccountUpdate {
+                    confidential: Some(ConfidentialTransferAccountUpdate {
+                        elgamal_pubkey: keys.elgamal_pubkey,
+                        aes_key: Some(keys.aes_key),
+                        amount: Some(10),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                Some(token_program.to_string()),
+            )
+            .await
+            .expect("set_token_account should succeed");
+
+        assert!(
+            client
+                .rpc
+                .get_confidential_balance(
+                    Some(client.context.clone()),
+                    token_account.to_string(),
+                    ConfidentialBalanceKeys::default(),
+                )
+                .await
+                .is_err(),
+            "reading with no keys at all should fail rather than return two nulls"
+        );
+
+        // A wrong AES key must fail the ciphertext's authentication tag rather than
+        // silently decrypt to some other number.
+        let wrong_keys = client
+            .rpc
+            .derive_confidential_keys(
+                Some(client.context.clone()),
+                bs58::encode(Keypair::new().to_bytes()).into_string(),
+                token_account.to_string(),
+            )
+            .expect("key derivation should succeed")
+            .value;
+        assert!(
+            client
+                .rpc
+                .get_confidential_balance(
+                    Some(client.context.clone()),
+                    token_account.to_string(),
+                    ConfidentialBalanceKeys {
+                        aes_key: Some(wrong_keys.aes_key),
+                        elgamal_secret_key: None,
+                    },
+                )
+                .await
+                .is_err(),
+            "the wrong aesKey should fail rather than decrypt"
         );
     }
 }

@@ -1224,6 +1224,67 @@ pub struct ConfidentialTransferAccountUpdate {
     pub maximum_pending_balance_credit_counter: Option<u64>,
 }
 
+/// The owner's confidential-transfer secrets, passed to
+/// `surfnet_getConfidentialBalance` so it can decrypt the account.
+///
+/// Each key unlocks a different half of the balance, so they are independently
+/// optional: a caller holding only one still gets the half it can read.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "ts-bindings",
+    derive(ts_rs::TS),
+    ts(export, optional_fields)
+)]
+pub struct ConfidentialBalanceKeys {
+    /// The owner's AES key (base58 or base64, 16 bytes). Decrypts the available
+    /// balance.
+    pub aes_key: Option<String>,
+    /// The owner's ElGamal *secret* key (base58 or base64, 32 bytes) — not the
+    /// public key stored on the account. Decrypts the pending balance.
+    pub elgamal_secret_key: Option<String>,
+}
+
+/// The decrypted confidential-transfer balances of a Token-2022 token account,
+/// returned by `surfnet_getConfidentialBalance`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "ts-bindings",
+    derive(ts_rs::TS),
+    ts(export, optional_fields)
+)]
+pub struct GetConfidentialBalanceResponse {
+    /// The available (spendable) balance, or `null` if no `aesKey` was supplied.
+    #[cfg_attr(feature = "ts-bindings", ts(optional, type = "number | bigint"))]
+    pub available: Option<u64>,
+    /// The pending (credited but not yet applied) balance, or `null` if no
+    /// `elgamalSecretKey` was supplied.
+    #[cfg_attr(feature = "ts-bindings", ts(optional, type = "number | bigint"))]
+    pub pending: Option<u64>,
+    /// How many confidential credits are sitting in the pending balance. Non-zero
+    /// means an `ApplyPendingBalance` is required before they show up in
+    /// `available`.
+    #[cfg_attr(feature = "ts-bindings", ts(type = "number | bigint"))]
+    pub pending_balance_credit_counter: u64,
+}
+
+/// The confidential-transfer keys derived for a token account, returned by
+/// `surfnet_deriveConfidentialKeys`. All three are base58-encoded and feed
+/// directly into the other confidential cheatcodes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct DeriveConfidentialKeysResponse {
+    /// The ElGamal public key — `surfnet_setTokenAccount`'s `elgamalPubkey`.
+    pub elgamal_pubkey: String,
+    /// The ElGamal secret key — `surfnet_getConfidentialBalance`'s
+    /// `elgamalSecretKey`.
+    pub elgamal_secret_key: String,
+    /// The AES key — the `aesKey` of both of the above.
+    pub aes_key: String,
+}
+
 // token supply update for set supply method in SVM tricks
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[cfg_attr(
@@ -1715,12 +1776,14 @@ pub enum CheatcodeFilter {
 /// `surfpool-core/src/rpc/surfnet_cheatcodes.rs` asserts it matches the
 /// methods actually registered by the `SurfnetCheatcodes` trait, so adding,
 /// removing, or renaming a cheatcode without updating this list fails CI.
-pub const SURFNET_CHEATCODE_METHODS: [&str; 26] = [
+pub const SURFNET_CHEATCODE_METHODS: [&str; 28] = [
     "surfnet_cloneProgramAccount",
+    "surfnet_deriveConfidentialKeys",
     "surfnet_disableCheatcode",
     "surfnet_enableCheatcode",
     "surfnet_exportSnapshot",
     "surfnet_getActiveIdl",
+    "surfnet_getConfidentialBalance",
     "surfnet_getLocalSignatures",
     "surfnet_getProfileResultsByTag",
     "surfnet_getStreamedAccounts",

@@ -11121,9 +11121,25 @@ async fn test_request_airdrop_rejects_below_rent_amount() {
 ///
 /// The three legs are `surfnet_deriveConfidentialKeys`, a `Deposit` plus an
 /// `ApplyPendingBalance` executed by the Token-2022 program itself, and
-/// `surfnet_getConfidentialBalance`. Every assertion is on a decrypted amount,
-/// so the test fails if the cheatcodes and the on-chain program disagree about
-/// the ciphertexts rather than only when a call errors.
+/// `surfnet_getConfidentialBalance`. Four assertions read decrypted balances
+/// back through the cheatcode; the others are on plaintext account fields and
+/// on call status. The ones that bind hardest are the plaintext fields the
+/// program itself computes: the public token balance falls by exactly the
+/// deposited amount, and the pending credit counter goes to 1 and back to 0.
+/// A deposit that silently did nothing fails the test on those. The decrypted
+/// pending balance pins the response shape and the field plumbing rather than
+/// the key, because a `Deposit` adds to the commitment and passes the ElGamal
+/// decrypt handle through untouched: starting from a zero balance, the
+/// resulting ciphertext opens to the same value under any secret key. The
+/// decrypted available balance round-trips this test's own AES ciphertext, so
+/// it shows that `AeKey` encryption and decryption agree and that the cheatcode
+/// reads the right field. That decryption binds to the ElGamal key at all is
+/// covered elsewhere, by the foreign-key rejection in
+/// `test_confidential_pending_balance_recombines_lo_and_hi`.
+///
+/// The account is put into its configured state by `surfnet_setTokenAccount`
+/// rather than by an on-chain `ConfigureAccount`, which is proof-gated and so
+/// blocked by the same SDK skew as `Transfer`.
 ///
 /// The deposit path is the confidential-balance movement that carries no
 /// zero-knowledge proof. A party-to-party `Transfer` additionally needs proofs

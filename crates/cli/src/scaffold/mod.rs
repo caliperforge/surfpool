@@ -137,10 +137,26 @@ impl ProgramMetadata {
 
 const DEV_SKILL_REPO: &str = "https://github.com/solana-foundation/solana-dev-skill";
 
-/// Builds the skill install exactly as issue #567 specifies it.
-fn dev_skill_install_command() -> Command {
+/// Pinned: an unversioned `npx skills` runs whatever the registry calls latest
+/// at the moment of someone's first scaffold, which is not a thing this can
+/// promise anyone. An exact version is the only form that resolves the same way
+/// twice; a range still floats to the newest release inside it.
+const DEV_SKILL_INSTALLER: &str = "skills@1.5.22";
+
+/// Builds the skill install as issue #567 specifies it, pinned, and rooted at
+/// the project being scaffolded rather than wherever the process happens to sit.
+fn dev_skill_install_command(base_location: &FileLocation) -> Command {
     let mut command = Command::new("npx");
-    command.args(["-y", "skills", "add", DEV_SKILL_REPO, "--skill", "*", "-y"]);
+    command.args([
+        "-y",
+        DEV_SKILL_INSTALLER,
+        "add",
+        DEV_SKILL_REPO,
+        "--skill",
+        "*",
+        "-y",
+    ]);
+    command.current_dir(base_location.expect_path_buf());
     command
 }
 
@@ -236,10 +252,6 @@ pub fn scaffold_iac_layout(
     base_location: &FileLocation,
     auto_generate_runbooks: bool,
 ) -> Result<(), String> {
-    // Reached only when the project has no `txtx.yml` yet, so this is a first
-    // start; #567 asks for the skills here. Ahead of the prompts, to overlap.
-    spawn_dev_skill_install(dev_skill_install_command());
-
     let mut target_location = base_location.clone();
     target_location.append_path("target")?;
 
@@ -462,6 +474,9 @@ pub fn scaffold_iac_layout(
             //     "file {} already exists. choose a different runbook name, or rename the existing file",
             //     runbook_file_location.to_string()
             // ))
+            // The scaffold succeeded — `txtx.yml` and the runbooks tree are on
+            // disk — so the install belongs here too. No later start re-enters.
+            spawn_dev_skill_install(dev_skill_install_command(base_location));
             return Ok(());
         }
         false => {
@@ -546,17 +561,29 @@ pub fn scaffold_iac_layout(
         println!("Deployment canceled");
     }
 
+    // Last, so the install only ever follows a scaffold that finished. Every
+    // exit above this line is an `Err` from a `?`, prompt cancellations
+    // included, and leaves no install running behind it. The one exception is
+    // the early `Ok(())` when `main.tx` already exists, which is a finished
+    // scaffold and starts its own. `txtx.yml` is written well above here, so
+    // the next start is no longer a scaffold and neither call site can fire twice.
+    spawn_dev_skill_install(dev_skill_install_command(base_location));
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
+        path::Path,
         process::Command,
         time::{Duration, Instant},
     };
 
-    use super::{DEV_SKILL_REPO, dev_skill_install_command, spawn_dev_skill_install};
+    use super::{
+        DEV_SKILL_INSTALLER, DEV_SKILL_REPO, FileLocation, dev_skill_install_command,
+        spawn_dev_skill_install,
+    };
 
     #[cfg(unix)]
     fn sh(script: &str) -> Command {
@@ -566,14 +593,48 @@ mod tests {
     }
 
     /// #567 supplied this invocation literally: the `-y` flags keep it off a
-    /// prompt and `--skill "*"` is what makes it the whole bundle.
+    /// prompt and `--skill "*"` is what makes it the whole bundle. The one
+    /// departure from its text is the pinned version, which is here in full so
+    /// that dropping the pin has to fail this.
     #[test]
     fn the_install_is_the_command_issue_567_asked_for() {
-        let command = dev_skill_install_command();
+        let base = FileLocation::from_path_string("/tmp/surfpool-567-scaffold").unwrap();
+        let command = dev_skill_install_command(&base);
         assert_eq!(command.get_program(), "npx");
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
-            ["-y", "skills", "add", DEV_SKILL_REPO, "--skill", "*", "-y"]
+            [
+                "-y",
+                DEV_SKILL_INSTALLER,
+                "add",
+                DEV_SKILL_REPO,
+                "--skill",
+                "*",
+                "-y"
+            ]
+        );
+        let (package, version) = DEV_SKILL_INSTALLER
+            .split_once('@')
+            .expect("installer is pinned");
+        assert_eq!(package, "skills");
+        assert!(
+            version.split('.').count() == 3
+                && version
+                    .split('.')
+                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())),
+            "the installer must stay pinned to an exact version, not a range: {version}"
+        );
+    }
+
+    /// The install writes into the project being scaffolded, which is the
+    /// manifest's directory rather than the shell's. `surfpool start -m
+    /// ../elsewhere/txtx.yml` scaffolds a tree the caller is not standing in.
+    #[test]
+    fn the_install_runs_in_the_scaffolded_project_not_the_process_cwd() {
+        let base = FileLocation::from_path_string("/tmp/surfpool-567-scaffold").unwrap();
+        assert_eq!(
+            dev_skill_install_command(&base).get_current_dir(),
+            Some(Path::new("/tmp/surfpool-567-scaffold"))
         );
     }
 

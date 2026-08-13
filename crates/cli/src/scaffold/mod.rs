@@ -1,6 +1,7 @@
 use std::{
     env,
     fs::{self, File},
+    process::{Command, Stdio},
 };
 
 use dialoguer::{Confirm, Input, MultiSelect, console::Style, theme::ColorfulTheme};
@@ -134,6 +135,35 @@ impl ProgramMetadata {
     }
 }
 
+const DEV_SKILL_REPO: &str = "https://github.com/solana-foundation/solana-dev-skill";
+
+/// Builds the skill install exactly as issue #567 specifies it.
+fn dev_skill_install_command() -> Command {
+    let mut command = Command::new("npx");
+    command.args(["-y", "skills", "add", DEV_SKILL_REPO, "--skill", "*", "-y"]);
+    command
+}
+
+/// Starts the skill install and returns, whatever becomes of it.
+///
+/// This runs on the way to booting someone's surfnet, so it gets no say in
+/// that: never waited on, output never reaching the terminal, and nothing at
+/// all on a machine without Node — the usual case for a Rust user.
+fn spawn_dev_skill_install(mut command: Command) {
+    let Ok(mut child) = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    // Reaped off-thread: the child leaves no defunct entry, the scaffold no wait.
+    let _ = hiro_system_kit::thread_named("Dev Skill Install").spawn(move || {
+        let _ = child.wait();
+    });
+}
+
 pub fn scaffold_in_memory_iac(
     framework: &Framework,
     programs: &[ProgramMetadata],
@@ -206,6 +236,10 @@ pub fn scaffold_iac_layout(
     base_location: &FileLocation,
     auto_generate_runbooks: bool,
 ) -> Result<(), String> {
+    // Reached only when the project has no `txtx.yml` yet, so this is a first
+    // start; #567 asks for the skills here. Ahead of the prompts, to overlap.
+    spawn_dev_skill_install(dev_skill_install_command());
+
     let mut target_location = base_location.clone();
     target_location.append_path("target")?;
 
@@ -513,4 +547,51 @@ pub fn scaffold_iac_layout(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        process::Command,
+        time::{Duration, Instant},
+    };
+
+    use super::{DEV_SKILL_REPO, dev_skill_install_command, spawn_dev_skill_install};
+
+    #[cfg(unix)]
+    fn sh(script: &str) -> Command {
+        let mut command = Command::new("sh");
+        command.args(["-c", script]);
+        command
+    }
+
+    /// #567 supplied this invocation literally: the `-y` flags keep it off a
+    /// prompt and `--skill "*"` is what makes it the whole bundle.
+    #[test]
+    fn the_install_is_the_command_issue_567_asked_for() {
+        let command = dev_skill_install_command();
+        assert_eq!(command.get_program(), "npx");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["-y", "skills", "add", DEV_SKILL_REPO, "--skill", "*", "-y"]
+        );
+    }
+
+    /// The three ways this goes wrong on a real machine: no Node at all, an
+    /// install that fails, an install that hangs. Each returns at once and
+    /// returns nothing, so the scaffold has neither a value to branch on nor a
+    /// wait to be held by — its result and its output are the same either way.
+    #[cfg(unix)]
+    #[test]
+    fn no_outcome_of_the_install_reaches_the_scaffold() {
+        let started = Instant::now();
+        spawn_dev_skill_install(Command::new("surfpool-567-no-such-binary"));
+        spawn_dev_skill_install(sh("exit 1"));
+        spawn_dev_skill_install(sh("sleep 30"));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the scaffold waited on the install: {:?}",
+            started.elapsed()
+        );
+    }
 }

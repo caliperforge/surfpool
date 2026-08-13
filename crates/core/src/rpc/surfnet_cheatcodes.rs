@@ -1333,9 +1333,19 @@ pub trait SurfnetCheatcodes {
     /// ```
     ///
     /// # Notes
-    /// The derivation matches what a confidential-transfer client computes from the same keypair, so
-    /// keys produced here interoperate with keys derived off-chain. The keypair is used only to sign
-    /// the derivation seeds; it is not stored.
+    /// These keys are self-consistent within a surfnet: pair them with `surfnet_setTokenAccount` and
+    /// `surfnet_getConfidentialBalance` and the confidential cheatcodes round-trip. They do **not**
+    /// currently reproduce the keys a confidential-transfer client derives for the same keypair, so
+    /// they will not open the balance of an account that was configured off-chain.
+    ///
+    /// Two things differ from the standardised derivation in `solana_zk_sdk::encryption::derivation`.
+    /// The key derivation function is the older `new_from_signer` path, which that SDK itself flags as
+    /// non-standard and replaces with HKDF-SHA512. And the public seed here is prefixed with
+    /// `solana-conf-bal/v1`, which the standardised derivation already applies internally as its HKDF
+    /// salt. Closing the gap means reaching that derivation, which is not available through the
+    /// Token-2022 interface crate this build pins.
+    ///
+    /// The keypair is used only to sign the derivation seeds; it is not stored.
     #[rpc(meta, name = "surfnet_deriveConfidentialKeys")]
     fn derive_confidential_keys(
         &self,

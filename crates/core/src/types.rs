@@ -1418,8 +1418,17 @@ fn decrypt_pending_balance(
 }
 
 /// The per-token-account public seed the confidential keys are derived over. The
-/// signature of this seed — not the wallet's private key, which hardware signers
-/// never expose — is what the key derivation is hashed from.
+/// signature of this seed, not the wallet's private key, which hardware signers
+/// never expose, is what the key derivation is hashed from.
+///
+/// This prefix is non-standard and the derived keys are surfnet-local as a result.
+/// `solana_zk_sdk::encryption::derivation` applies this same `solana-conf-bal/v1`
+/// string itself, as its HKDF salt, so prepending it to the seed applies it twice.
+/// Reference clients pass the seed unprefixed: an empty seed for per-wallet keying,
+/// or the raw token account address for per-account keying. Dropping the prefix on
+/// its own would not make these keys interoperable, because the derivation reachable
+/// from the pinned Token-2022 interface crate is also the older, pre-HKDF one; both
+/// have to move together.
 const CONFIDENTIAL_KEY_SEED_PREFIX: &[u8] = b"solana-conf-bal/v1";
 
 /// Derive an owner's confidential-transfer keys for a token account.

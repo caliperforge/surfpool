@@ -11121,21 +11121,29 @@ async fn test_request_airdrop_rejects_below_rent_amount() {
 ///
 /// The three legs are `surfnet_deriveConfidentialKeys`, a `Deposit` plus an
 /// `ApplyPendingBalance` executed by the Token-2022 program itself, and
-/// `surfnet_getConfidentialBalance`. Four assertions read decrypted balances
-/// back through the cheatcode; the others are on plaintext account fields and
-/// on call status. The ones that bind hardest are the plaintext fields the
-/// program itself computes: the public token balance falls by exactly the
-/// deposited amount, and the pending credit counter goes to 1 and back to 0.
-/// A deposit that silently did nothing fails the test on those. The decrypted
-/// pending balance pins the response shape and the field plumbing rather than
-/// the key, because a `Deposit` adds to the commitment and passes the ElGamal
-/// decrypt handle through untouched: starting from a zero balance, the
-/// resulting ciphertext opens to the same value under any secret key. The
-/// decrypted available balance round-trips this test's own AES ciphertext, so
-/// it shows that `AeKey` encryption and decryption agree and that the cheatcode
-/// reads the right field. That decryption binds to the ElGamal key at all is
-/// covered elsewhere, by the foreign-key rejection in
-/// `test_confidential_pending_balance_recombines_lo_and_hi`.
+/// `surfnet_getConfidentialBalance`.
+///
+/// The pending balance is seeded with a real ElGamal encryption under the
+/// derived public key before the deposit runs, so the ciphertext the deposit
+/// lands on carries a decrypt handle that is not the identity point. Two
+/// assertions then bind that read to the derived key: the derived secret key
+/// recovers seed plus deposit exactly, and a random ElGamal secret key recovers
+/// nothing. Replace the derived key with a stranger's and the test fails. The
+/// seeding step is deliberate — deposits onto the all-zero pending ciphertext a
+/// freshly configured account carries produce an identity handle, and such a
+/// ciphertext opens to the same value under any secret key. On-chain that state
+/// arrives via a party-to-party `Transfer`, which is proof-gated and out of
+/// reach here, so the test writes it directly.
+///
+/// What the rest of the assertions carry: the plaintext fields the program
+/// itself computes — the public token balance falls by exactly the deposited
+/// amount, and the pending credit counter goes to 1 and back to 0 — catch a
+/// deposit that silently did nothing. The decrypted available balance
+/// round-trips this test's own AES ciphertext, so it shows that `AeKey`
+/// encryption and decryption agree and that the cheatcode reads the right
+/// field; it does not bind to the ElGamal key. The post-apply pending read of 0
+/// is a shape check, not a key check: `ApplyPendingBalance` resets the pending
+/// ciphertext to all-zero, which decodes to 0 under any key.
 ///
 /// The account is put into its configured state by `surfnet_setTokenAccount`
 /// rather than by an on-chain `ConfigureAccount`, which is proof-gated and so
@@ -11152,9 +11160,16 @@ async fn test_request_airdrop_rejects_below_rent_amount() {
 async fn test_confidential_balance_deposit_round_trip(test_type: TestType) {
     use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
     use spl_token_2022_interface::{
-        extension::confidential_transfer::instruction as confidential_instruction,
+        extension::{
+            BaseStateWithExtensionsMut, StateWithExtensionsMut,
+            confidential_transfer::{
+                ConfidentialTransferAccount, instruction as confidential_instruction,
+            },
+        },
         solana_zk_sdk::encryption::{
-            auth_encryption::AeKey, pod::auth_encryption::PodAeCiphertext,
+            auth_encryption::AeKey,
+            elgamal::{ElGamalKeypair, ElGamalPubkey},
+            pod::auth_encryption::PodAeCiphertext,
         },
     };
     use surfpool_types::types::{
@@ -11283,6 +11298,36 @@ async fn test_confidential_balance_deposit_round_trip(test_type: TestType) {
         .await
         .expect("setTokenAccount should succeed");
 
+    // Give the pending balance a real ElGamal ciphertext before the deposit
+    // lands on it. `Deposit` adds the amount to the commitment and passes the
+    // decrypt handle through untouched, so a deposit onto the all-zero pending
+    // ciphertext a configured account starts with produces an identity handle,
+    // and that opens to the same value under any secret key. Encrypting under
+    // the derived public key first gives the ciphertext a handle only the
+    // derived secret key cancels. On-chain the same state arrives via a
+    // party-to-party `Transfer`, which is proof-gated and blocked here by the
+    // SDK skew, so the account is seeded directly instead.
+    let seeded_pending = 1_500u64;
+    let elgamal_pubkey_bytes = bs58::decode(&keys.elgamal_pubkey).into_vec().unwrap();
+    let elgamal_pubkey = ElGamalPubkey::try_from(elgamal_pubkey_bytes.as_slice())
+        .expect("derived elgamalPubkey should parse");
+    let mut seeded_account = svm_locker
+        .with_svm_reader(|svm| svm.inner.get_account(&token_account).unwrap())
+        .expect("token account should exist");
+    {
+        let mut state = StateWithExtensionsMut::<spl_token_2022_interface::state::Account>::unpack(
+            &mut seeded_account.data,
+        )
+        .expect("token account should unpack with extensions");
+        let ext = state
+            .get_extension_mut::<ConfidentialTransferAccount>()
+            .expect("confidential extension should be present");
+        ext.pending_balance_lo = elgamal_pubkey.encrypt_u64(seeded_pending).into();
+    }
+    svm_locker
+        .with_svm_writer(|svm| svm.set_account(&token_account, seeded_account))
+        .expect("seeding the pending balance should succeed");
+
     // Leg 2: a real confidential-transfer deposit, executed by Token-2022.
     let deposit_amount = 4_000u64;
     let deposit_ix = confidential_instruction::deposit(
@@ -11314,14 +11359,58 @@ async fn test_confidential_balance_deposit_round_trip(test_type: TestType) {
     );
 
     // Leg 3: read the balance back. The deposit credits the pending balance,
-    // which only the ElGamal secret key can open.
+    // which only the derived ElGamal secret key can open.
+    let owner_elgamal_secret_key = keys.elgamal_secret_key.clone();
+    let expected_pending = seeded_pending + deposit_amount;
+
+    // The pending balance is bound to the derived key: the owner's secret key
+    // recovers the seeded amount plus the deposit, and a stranger's recovers
+    // nothing.
+    let pending_under_owner = rpc_server
+        .get_confidential_balance(
+            Some(runloop_context.clone()),
+            token_account.to_string(),
+            ConfidentialBalanceKeys {
+                aes_key: None,
+                elgamal_secret_key: Some(owner_elgamal_secret_key.clone()),
+            },
+        )
+        .await
+        .map(|response| response.value.pending)
+        .unwrap_or(None);
+    assert_eq!(
+        pending_under_owner,
+        Some(expected_pending),
+        "the derived ElGamal secret key should recover the seeded pending balance plus the deposit"
+    );
+
+    let foreign_elgamal = ElGamalKeypair::new_rand();
+    let pending_under_foreign = rpc_server
+        .get_confidential_balance(
+            Some(runloop_context.clone()),
+            token_account.to_string(),
+            ConfidentialBalanceKeys {
+                aes_key: None,
+                elgamal_secret_key: Some(
+                    bs58::encode(<[u8; 32]>::from(foreign_elgamal.secret())).into_string(),
+                ),
+            },
+        )
+        .await
+        .map(|response| response.value.pending)
+        .unwrap_or(None);
+    assert_eq!(
+        pending_under_foreign, None,
+        "a foreign ElGamal secret key must fail to recover the pending balance"
+    );
+
     let after_deposit = rpc_server
         .get_confidential_balance(
             Some(runloop_context.clone()),
             token_account.to_string(),
             ConfidentialBalanceKeys {
                 aes_key: Some(keys.aes_key.clone()),
-                elgamal_secret_key: Some(keys.elgamal_secret_key.clone()),
+                elgamal_secret_key: Some(owner_elgamal_secret_key.clone()),
             },
         )
         .await
@@ -11329,7 +11418,7 @@ async fn test_confidential_balance_deposit_round_trip(test_type: TestType) {
         .value;
     assert_eq!(
         after_deposit.pending,
-        Some(deposit_amount),
+        Some(expected_pending),
         "the deposited amount should decrypt out of the pending balance"
     );
     assert_eq!(
@@ -11362,7 +11451,7 @@ async fn test_confidential_balance_deposit_round_trip(test_type: TestType) {
         .unwrap()
         .try_into()
         .unwrap();
-    let new_available = PodAeCiphertext::from(AeKey::from(aes_bytes).encrypt(deposit_amount));
+    let new_available = PodAeCiphertext::from(AeKey::from(aes_bytes).encrypt(expected_pending));
     let apply_ix = confidential_instruction::apply_pending_balance(
         &token_program,
         &token_account,
@@ -11395,7 +11484,7 @@ async fn test_confidential_balance_deposit_round_trip(test_type: TestType) {
             token_account.to_string(),
             ConfidentialBalanceKeys {
                 aes_key: Some(keys.aes_key.clone()),
-                elgamal_secret_key: Some(keys.elgamal_secret_key.clone()),
+                elgamal_secret_key: Some(owner_elgamal_secret_key.clone()),
             },
         )
         .await
@@ -11403,7 +11492,7 @@ async fn test_confidential_balance_deposit_round_trip(test_type: TestType) {
         .value;
     assert_eq!(
         after_apply.available,
-        Some(deposit_amount),
+        Some(expected_pending),
         "the applied amount should decrypt out of the available balance"
     );
     assert_eq!(

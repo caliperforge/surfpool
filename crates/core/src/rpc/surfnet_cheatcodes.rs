@@ -1235,7 +1235,7 @@ pub trait SurfnetCheatcodes {
     /// ## Returns
     /// A `RpcResponse<GetConfidentialBalanceResponse>` with the decrypted `available` and `pending`
     /// amounts (each `null` when the corresponding key was not supplied), plus the account's
-    /// `pendingBalanceCreditCounter` — non-zero means an `ApplyPendingBalance` is still needed
+    /// `pendingBalanceCreditCounter`: non-zero means an `ApplyPendingBalance` is still needed
     /// before the pending amount shows up in `available`.
     ///
     /// ## Example Request
@@ -1359,13 +1359,13 @@ pub trait SurfnetCheatcodes {
     ///
     /// What that does and does not buy is worth stating plainly. Because the ElGamal secret is a
     /// hash of the signature, `elgamalSignature` is exactly as sensitive as the `elgamalSecretKey`
-    /// it derives — anyone who sees it recomputes that key offline. What changed is that the
+    /// it derives: anyone who sees it recomputes that key offline. What changed is that the
     /// material on the wire no longer confers transaction-signing power, only confidential-balance
     /// decryption; it is not that nothing sensitive is transported.
     ///
     /// The derived `elgamalSecretKey` and `aesKey` do travel back in the response, and
     /// `surfnet_getConfidentialBalance` takes them back as inputs. That is the point of the
-    /// cheatcode — it is what removes the client-side crypto dependency — but it does mean the
+    /// cheatcode; it is what removes the client-side crypto dependency. It does mean the
     /// confidential keys are transported and are only as private as the RPC connection. This is a
     /// simnet testing convenience, not a key-management pattern to carry to a live cluster.
     #[rpc(meta, name = "surfnet_deriveConfidentialKeys")]

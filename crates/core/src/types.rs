@@ -1367,7 +1367,7 @@ pub fn build_confidential_token_account_data(
 /// confidential test loop whose write half is `surfnet_setTokenAccount`. Each
 /// balance has its own key because the extension stores them differently:
 /// - **available** is read from `decryptable_available_balance`, the AES copy the
-///   owner supplies and the program stores verbatim — the program holds no AES key,
+///   owner supplies and the program stores verbatim. The program holds no AES key,
 ///   so it never computes this field. The authoritative `available_balance` is an
 ///   ElGamal ciphertext over a full u64 and is not recoverable by the u32
 ///   discrete-log decode, so the AES copy is the only read path.

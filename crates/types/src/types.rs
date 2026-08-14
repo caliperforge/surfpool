@@ -1240,7 +1240,7 @@ pub struct ConfidentialBalanceKeys {
     /// The owner's AES key (base58 or base64, 16 bytes). Decrypts the available
     /// balance.
     pub aes_key: Option<String>,
-    /// The owner's ElGamal *secret* key (base58 or base64, 32 bytes) — not the
+    /// The owner's ElGamal *secret* key (base58 or base64, 32 bytes), not the
     /// public key stored on the account. Decrypts the pending balance.
     pub elgamal_secret_key: Option<String>,
 }
@@ -1275,12 +1275,12 @@ pub struct GetConfidentialBalanceResponse {
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 pub struct DeriveConfidentialKeysResponse {
-    /// The ElGamal public key — `surfnet_setTokenAccount`'s `elgamalPubkey`.
+    /// The ElGamal public key: `surfnet_setTokenAccount`'s `elgamalPubkey`.
     pub elgamal_pubkey: String,
-    /// The ElGamal secret key — `surfnet_getConfidentialBalance`'s
+    /// The ElGamal secret key: `surfnet_getConfidentialBalance`'s
     /// `elgamalSecretKey`.
     pub elgamal_secret_key: String,
-    /// The AES key — the `aesKey` of both of the above.
+    /// The AES key: the `aesKey` of both of the above.
     pub aes_key: String,
 }
 

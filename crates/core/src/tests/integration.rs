@@ -11122,7 +11122,7 @@ async fn test_request_airdrop_rejects_below_rent_amount() {
 ///
 /// The pending balance is seeded with a real ElGamal encryption under the derived
 /// public key first, so the ciphertext the deposit lands on carries a decrypt
-/// handle that is not the identity point — deposits onto the all-zero pending
+/// handle that is not the identity point. Deposits onto the all-zero pending
 /// ciphertext a freshly configured account carries produce an identity handle,
 /// and such a ciphertext opens to the same value under any secret key. On chain
 /// that state arrives via a party-to-party `Transfer`, which is proof-gated and
@@ -11131,13 +11131,13 @@ async fn test_request_airdrop_rejects_below_rent_amount() {
 /// exactly, and a random ElGamal secret key recovers nothing.
 ///
 /// The remaining assertions are weaker, and labelled as such. The plaintext
-/// fields the program itself computes — public token balance down by exactly the
-/// deposited amount, pending credit counter to 1 and back to 0 — only catch a
+/// fields the program itself computes (public token balance down by exactly the
+/// deposited amount, pending credit counter to 1 and back to 0) only catch a
 /// deposit that silently did nothing. The decrypted available balance round-trips
 /// this test's own AES ciphertext: it shows that `AeKey` encryption and
 /// decryption agree and that the cheatcode reads the right field, but it does not
 /// bind to the ElGamal key. The post-apply pending read of 0 is a shape check,
-/// not a key check — `ApplyPendingBalance` resets that ciphertext to all-zero,
+/// not a key check: `ApplyPendingBalance` resets that ciphertext to all-zero,
 /// which decodes to 0 under any key.
 ///
 /// The account reaches its configured state via `surfnet_setTokenAccount` rather
@@ -11503,7 +11503,7 @@ async fn test_confidential_balance_deposit_round_trip(test_type: TestType) {
     );
 }
 
-/// **This test is `#[ignore]`d and does not run — nothing described below is
+/// **This test is `#[ignore]`d and does not run. Nothing described below is
 /// asserted by the suite.** See the `# Why this is ignored` section.
 ///
 /// The round trip the confidential cheatcodes exist to support, end to end and
@@ -11551,7 +11551,7 @@ async fn test_confidential_balance_deposit_round_trip(test_type: TestType) {
 /// `CiphertextCommitmentEqualityProofContext::new_transcript`, which also seeds
 /// the transcript with `Transcript::new` where 5.0.1 uses
 /// `Transcript::new_zk_elgamal_transcript`. So both versions absorb the same
-/// context, but at different layers and from a different starting state —
+/// context, but at different layers and from a different starting state, which is
 /// worth being precise about, because "add the missing hash to 4.0.0" is not
 /// the fix it sounds like. Prover and verifier therefore derive different
 /// challenge scalars, and the program rejects the proof with
@@ -11559,12 +11559,12 @@ async fn test_confidential_balance_deposit_round_trip(test_type: TestType) {
 ///
 /// Everything in this section was observed by running the test locally; because
 /// it is ignored, nothing in the suite asserts any of it. In particular, no test
-/// in this change establishes that a confidential `Transfer` completes — the
+/// in this change establishes that a confidential `Transfer` completes: the
 /// assertions that would show it never execute. Treat that path as uncovered,
 /// not as working.
 ///
 /// Un-ignore this once proof generation and the runtime's proof program agree on
-/// a `solana-zk-sdk` major — either `litesvm` linking a 4.x proof program, or
+/// a `solana-zk-sdk` major, either `litesvm` linking a 4.x proof program, or
 /// `spl-token-2022-interface` moving to the 5.x proof stack.
 #[test_case(TestType::no_db(); "with no db")]
 #[tokio::test(flavor = "multi_thread")]
@@ -11935,7 +11935,7 @@ async fn test_confidential_balance_transfer_round_trip(test_type: TestType) {
 /// and read the result back with `surfnet_getConfidentialBalance`. The value
 /// crosses between the owners in the clear and only becomes confidential on the
 /// recipient's side; a confidential `Transfer` moves it entirely under encryption
-/// and is gated on proofs this build cannot verify — see
+/// and is gated on proofs this build cannot verify. See
 /// `test_confidential_balance_transfer_round_trip`.
 ///
 /// Two `surfnet_setTokenAccount` calls stage both accounts into a configured
@@ -11945,7 +11945,7 @@ async fn test_confidential_balance_transfer_round_trip(test_type: TestType) {
 /// cheatcode derives distinct keys for two owners and that the recipient's
 /// derived AES key opens the recipient's available balance while the sender's
 /// does not. That read round-trips this test's own `AeKey::encrypt`, because
-/// `ApplyPendingBalance` stores the ciphertext its caller hands it — the same
+/// `ApplyPendingBalance` stores the ciphertext its caller hands it, the same
 /// caveat the sibling deposit test carries.
 #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
 #[test_case(TestType::in_memory(); "with in-memory sqlite db")]

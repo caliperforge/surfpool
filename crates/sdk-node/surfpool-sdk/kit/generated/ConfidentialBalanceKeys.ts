@@ -16,7 +16,7 @@ export type ConfidentialBalanceKeys = {
    */
   aesKey?: string;
   /**
-   * The owner's ElGamal *secret* key (base58 or base64, 32 bytes) — not the
+   * The owner's ElGamal *secret* key (base58 or base64, 32 bytes), not the
    * public key stored on the account. Decrypts the pending balance.
    */
   elgamalSecretKey?: string;

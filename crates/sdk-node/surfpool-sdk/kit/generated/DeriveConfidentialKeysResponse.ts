@@ -9,16 +9,16 @@
  */
 export type DeriveConfidentialKeysResponse = {
   /**
-   * The ElGamal public key — `surfnet_setTokenAccount`'s `elgamalPubkey`.
+   * The ElGamal public key: `surfnet_setTokenAccount`'s `elgamalPubkey`.
    */
   elgamalPubkey: string;
   /**
-   * The ElGamal secret key — `surfnet_getConfidentialBalance`'s
+   * The ElGamal secret key: `surfnet_getConfidentialBalance`'s
    * `elgamalSecretKey`.
    */
   elgamalSecretKey: string;
   /**
-   * The AES key — the `aesKey` of both of the above.
+   * The AES key: the `aesKey` of both of the above.
    */
   aesKey: string;
 };

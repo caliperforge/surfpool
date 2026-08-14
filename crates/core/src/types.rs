@@ -13,7 +13,6 @@ use solana_account_decoder::{
 };
 use solana_clock::{Epoch, Slot};
 use solana_hash::Hash;
-use solana_keypair::Keypair;
 use solana_message::{
     AccountKeys, VersionedMessage,
     v0::{LoadedAddresses, LoadedMessage, MessageAddressTableLookup},
@@ -21,6 +20,7 @@ use solana_message::{
 use solana_program_option::COption;
 use solana_program_pack::Pack;
 use solana_pubkey::Pubkey;
+use solana_signature::{SIGNATURE_BYTES, Signature};
 use solana_transaction::{
     sanitized::SanitizedTransaction,
     versioned::{TransactionVersion, VersionedTransaction},
@@ -1237,6 +1237,22 @@ fn decode_confidential_key(input: &str, expected_len: usize) -> Result<Vec<u8>, 
     Ok(bytes)
 }
 
+/// Decode one of the owner signatures the confidential key derivation is hashed
+/// from, accepting the same base58-or-base64 encodings as the key parameters.
+fn parse_confidential_key_signature(input: &str) -> Result<Signature, String> {
+    let bytes = decode_confidential_key(input, SIGNATURE_BYTES)?;
+    let signature = Signature::try_from(bytes.as_slice())
+        .map_err(|_| format!("expected a {SIGNATURE_BYTES}-byte Solana signature"))?;
+    // Some `Signer` implementations return the all-zero default signature instead of
+    // signing. `new_from_signer` rejects it as key material; `new_from_signature`, which
+    // this derivation calls, hashes whatever it is handed and would return a fixed key
+    // pair anyone can compute. Reject it here so both paths agree on this input.
+    if signature == Signature::default() {
+        return Err("expected a real signature, got the all-zero default".to_string());
+    }
+    Ok(signature)
+}
+
 /// Build the raw account data for a Token-2022 token account that carries the
 /// confidential-transfer extension (and, when `mint_has_transfer_fee` is set,
 /// the companion confidential-transfer fee-amount extension).
@@ -1351,7 +1367,8 @@ pub fn build_confidential_token_account_data(
 /// confidential test loop whose write half is `surfnet_setTokenAccount`. Each
 /// balance has its own key because the extension stores them differently:
 /// - **available** is read from `decryptable_available_balance`, the AES copy the
-///   program maintains for the owner. The authoritative `available_balance` is an
+///   owner supplies and the program stores verbatim — the program holds no AES key,
+///   so it never computes this field. The authoritative `available_balance` is an
 ///   ElGamal ciphertext over a full u64 and is not recoverable by the u32
 ///   discrete-log decode, so the AES copy is the only read path.
 /// - **pending** is read from the `lo`/`hi` ElGamal ciphertexts, each within the
@@ -1417,43 +1434,35 @@ fn decrypt_pending_balance(
     })
 }
 
-/// The per-token-account public seed the confidential keys are derived over. The
-/// signature of this seed, not the wallet's private key, which hardware signers
-/// never expose, is what the key derivation is hashed from.
-///
-/// This prefix is non-standard and the derived keys are surfnet-local as a result.
-/// `solana_zk_sdk::encryption::derivation` applies this same `solana-conf-bal/v1`
-/// string itself, as its HKDF salt, so prepending it to the seed applies it twice.
-/// Reference clients pass the seed unprefixed: an empty seed for per-wallet keying,
-/// or the raw token account address for per-account keying. Dropping the prefix on
-/// its own would not make these keys interoperable, because the derivation reachable
-/// from the pinned Token-2022 interface crate is also the older, pre-HKDF one; both
-/// have to move together.
-const CONFIDENTIAL_KEY_SEED_PREFIX: &[u8] = b"solana-conf-bal/v1";
-
-/// Derive an owner's confidential-transfer keys for a token account.
+/// Derive an owner's confidential-transfer keys from the owner's signatures.
 ///
 /// Backs the `surfnet_deriveConfidentialKeys` cheatcode. Doing this server-side is
 /// what lets the confidential cheatcodes be used with no client-side crypto
-/// dependency at all: the caller hands over the keypair its test already holds and
-/// gets back the exact keys a confidential client would have derived, ready to pass
+/// dependency at all: the caller signs the two seed messages its confidential
+/// client would sign, hands over the signatures, and gets back keys ready to pass
 /// to `surfnet_setTokenAccount` and `surfnet_getConfidentialBalance`.
 ///
-/// The ElGamal and AES keys are derived from signatures over two different messages,
-/// so this takes the keypair rather than a single pre-computed signature.
+/// The derivation semantics are documented once, on the RPC method that exposes this:
+/// see `surfnet_deriveConfidentialKeys` on
+/// [`crate::rpc::surfnet_cheatcodes::SurfnetCheatcodes`] for why the two seed messages are
+/// domain-separated and take one signature each, why the result is byte-identical to
+/// `ElGamalKeypair::new_from_signer` / `AeKey::new_from_signer`, and what does and does not
+/// cross the wire.
+///
+/// `derive_confidential_keys` itself imposes no seed: the caller owns what the keys are
+/// scoped to, because the caller owns what it signed.
 pub fn derive_confidential_keys(
-    keypair: &str,
-    token_account: &Pubkey,
+    elgamal_signature: &str,
+    ae_signature: &str,
 ) -> Result<DeriveConfidentialKeysResponse, String> {
-    let keypair_bytes =
-        decode_confidential_key(keypair, 64).map_err(|e| format!("keypair: {e}"))?;
-    let keypair = Keypair::try_from(keypair_bytes.as_slice())
-        .map_err(|e| format!("keypair: invalid Solana keypair ({e})"))?;
+    let elgamal_signature = parse_confidential_key_signature(elgamal_signature)
+        .map_err(|e| format!("elgamalSignature: {e}"))?;
+    let ae_signature =
+        parse_confidential_key_signature(ae_signature).map_err(|e| format!("aeSignature: {e}"))?;
 
-    let public_seed = [CONFIDENTIAL_KEY_SEED_PREFIX, token_account.as_ref()].concat();
-    let elgamal = ElGamalKeypair::new_from_signer(&keypair, &public_seed)
+    let elgamal = ElGamalKeypair::new_from_signature(&elgamal_signature)
         .map_err(|e| format!("failed to derive ElGamal keypair: {e}"))?;
-    let aes_key = AeKey::new_from_signer(&keypair, &public_seed)
+    let aes_key = AeKey::new_from_signature(&ae_signature)
         .map_err(|e| format!("failed to derive AES key: {e}"))?;
 
     let elgamal_secret_key: [u8; 32] = elgamal.secret().into();
@@ -1464,6 +1473,124 @@ pub fn derive_confidential_keys(
         elgamal_secret_key: bs58::encode(elgamal_secret_key).into_string(),
         aes_key: bs58::encode(aes_key).into_string(),
     })
+}
+
+/// Sign the two seed messages `derive_confidential_keys` expects, scoping the keys
+/// to `token_account`.
+///
+/// This is the client-side half of the cheatcode: it mirrors, in the open, what
+/// `ElGamalKeypair::new_from_signer` and `AeKey::new_from_signer` sign internally.
+#[cfg(test)]
+pub(crate) fn confidential_key_signatures(
+    owner: &solana_keypair::Keypair,
+    token_account: &Pubkey,
+) -> (String, String) {
+    use solana_signer::Signer;
+
+    let sign = |domain: &[u8]| {
+        owner
+            .sign_message(&[domain, token_account.as_ref()].concat())
+            .to_string()
+    };
+    (sign(b"ElGamalSecretKey"), sign(b"AeKey"))
+}
+
+#[cfg(test)]
+mod confidential_key_derivation_tests {
+    use solana_keypair::Keypair;
+
+    use super::*;
+
+    /// The whole point of moving from a keypair to signatures is that the keys do
+    /// not change. Derive both ways over the same owner and token account and
+    /// compare: `new_from_signer` signs `"ElGamalSecretKey" || seed` and
+    /// `"AeKey" || seed` itself and then calls the very `new_from_signature`
+    /// functions the cheatcode now calls, so the two paths must agree byte for byte.
+    #[test]
+    fn signatures_reproduce_the_keys_the_signer_path_derived() {
+        let owner = Keypair::new();
+        let token_account = Pubkey::new_unique();
+
+        let (elgamal_signature, ae_signature) = confidential_key_signatures(&owner, &token_account);
+        let from_signatures = derive_confidential_keys(&elgamal_signature, &ae_signature)
+            .expect("deriving from signatures should succeed");
+
+        // The reference path, with the standard per-account seed and no prefix.
+        let seed = token_account.as_ref();
+        let elgamal = ElGamalKeypair::new_from_signer(&owner, seed).unwrap();
+        let aes_key = AeKey::new_from_signer(&owner, seed).unwrap();
+        let elgamal_secret: [u8; 32] = elgamal.secret().into();
+        let aes_key_bytes: [u8; 16] = aes_key.into();
+
+        assert_eq!(
+            from_signatures.elgamal_pubkey,
+            bs58::encode(bytes_of(&PodElGamalPubkey::from(elgamal.pubkey_owned()))).into_string(),
+        );
+        assert_eq!(
+            from_signatures.elgamal_secret_key,
+            bs58::encode(elgamal_secret).into_string(),
+        );
+        assert_eq!(
+            from_signatures.aes_key,
+            bs58::encode(aes_key_bytes).into_string(),
+        );
+    }
+
+    /// The two seed messages are domain-separated, so reusing one signature for
+    /// both keys does not reproduce the signer path. This is why the cheatcode
+    /// takes two signatures rather than one.
+    #[test]
+    fn one_signature_cannot_stand_in_for_both() {
+        let owner = Keypair::new();
+        let token_account = Pubkey::new_unique();
+
+        let (elgamal_signature, ae_signature) = confidential_key_signatures(&owner, &token_account);
+        assert_ne!(elgamal_signature, ae_signature);
+
+        let reused = derive_confidential_keys(&elgamal_signature, &elgamal_signature).unwrap();
+        let correct = derive_confidential_keys(&elgamal_signature, &ae_signature).unwrap();
+
+        assert_eq!(reused.elgamal_pubkey, correct.elgamal_pubkey);
+        assert_ne!(reused.aes_key, correct.aes_key);
+    }
+
+    /// `new_from_signature` hashes the all-zero default signature happily, so
+    /// without an explicit check the cheatcode would hand back a fixed key pair
+    /// anyone can compute. `new_from_signer`, the path this replaced, rejects it.
+    /// Assert the rejection on both parameters and that the error names which one.
+    #[test]
+    fn the_default_signature_is_rejected_on_both_parameters() {
+        let owner = Keypair::new();
+        let token_account = Pubkey::new_unique();
+        let (elgamal_signature, ae_signature) = confidential_key_signatures(&owner, &token_account);
+        let default_signature = Signature::default().to_string();
+
+        // Why the check has to live here: the SDK functions this calls accept it.
+        assert!(ElGamalKeypair::new_from_signature(&Signature::default()).is_ok());
+        assert!(AeKey::new_from_signature(&Signature::default()).is_ok());
+
+        let error = derive_confidential_keys(&default_signature, &ae_signature).unwrap_err();
+        assert!(error.starts_with("elgamalSignature:"), "got: {error}");
+
+        let error = derive_confidential_keys(&elgamal_signature, &default_signature).unwrap_err();
+        assert!(error.starts_with("aeSignature:"), "got: {error}");
+    }
+
+    /// A 32-byte pubkey is valid base58 but is not a signature, and the error has
+    /// to name which of the two parameters was wrong.
+    #[test]
+    fn a_malformed_signature_names_its_parameter() {
+        let owner = Keypair::new();
+        let token_account = Pubkey::new_unique();
+        let (elgamal_signature, ae_signature) = confidential_key_signatures(&owner, &token_account);
+        let not_a_signature = token_account.to_string();
+
+        let error = derive_confidential_keys(&not_a_signature, &ae_signature).unwrap_err();
+        assert!(error.starts_with("elgamalSignature:"), "got: {error}");
+
+        let error = derive_confidential_keys(&elgamal_signature, &not_a_signature).unwrap_err();
+        assert!(error.starts_with("aeSignature:"), "got: {error}");
+    }
 }
 
 impl_token_program_packable_serde!(

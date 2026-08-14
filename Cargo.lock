@@ -12034,6 +12034,8 @@ dependencies = [
  "solana-version",
  "spl-associated-token-account-interface",
  "spl-token-2022-interface",
+ "spl-token-confidential-transfer-proof-extraction",
+ "spl-token-confidential-transfer-proof-generation",
  "spl-token-interface 2.0.0",
  "spl-token-metadata-interface",
  "surfpool-db",

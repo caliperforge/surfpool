@@ -150,6 +150,8 @@ solana-transaction-status = { version = "4.1", default-features = false, feature
 solana-version = { version = "4.0", default-features = false }
 spl-associated-token-account-interface = { version = "2.0.0", default-features = false }
 spl-token-2022-interface = { version = "2.0.0", default-features = false }
+spl-token-confidential-transfer-proof-extraction = { version = "0.5.1", default-features = false }
+spl-token-confidential-transfer-proof-generation = { version = "0.5.1", default-features = false }
 spl-token-interface = { version = "2.0.0", default-features = false }
 spl-token-metadata-interface = { version = "0.8.0", default-features = false }
 tempfile = "3.23.0"

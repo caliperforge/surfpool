@@ -11115,43 +11115,37 @@ async fn test_request_airdrop_rejects_below_rent_amount() {
     assert!(err.message.contains("rent-exempt minimum"));
 }
 
-/// Round trip: derive the owner's confidential keys, move tokens into the
-/// confidential balance with real Token-2022 instructions, and read the new
-/// balance back decrypted.
+/// Round trip: derive the owner's confidential keys with
+/// `surfnet_deriveConfidentialKeys`, move tokens into the confidential balance
+/// with a real `Deposit` plus `ApplyPendingBalance`, and read the new balance
+/// back with `surfnet_getConfidentialBalance`.
 ///
-/// The three legs are `surfnet_deriveConfidentialKeys`, a `Deposit` plus an
-/// `ApplyPendingBalance` executed by the Token-2022 program itself, and
-/// `surfnet_getConfidentialBalance`.
+/// The pending balance is seeded with a real ElGamal encryption under the derived
+/// public key first, so the ciphertext the deposit lands on carries a decrypt
+/// handle that is not the identity point — deposits onto the all-zero pending
+/// ciphertext a freshly configured account carries produce an identity handle,
+/// and such a ciphertext opens to the same value under any secret key. On chain
+/// that state arrives via a party-to-party `Transfer`, which is proof-gated and
+/// out of reach here, so the test writes it directly. Two assertions then bind
+/// the read to the derived key: the derived secret key recovers seed plus deposit
+/// exactly, and a random ElGamal secret key recovers nothing.
 ///
-/// The pending balance is seeded with a real ElGamal encryption under the
-/// derived public key before the deposit runs, so the ciphertext the deposit
-/// lands on carries a decrypt handle that is not the identity point. Two
-/// assertions then bind that read to the derived key: the derived secret key
-/// recovers seed plus deposit exactly, and a random ElGamal secret key recovers
-/// nothing. Replace the derived key with a stranger's and the test fails. The
-/// seeding step is deliberate — deposits onto the all-zero pending ciphertext a
-/// freshly configured account carries produce an identity handle, and such a
-/// ciphertext opens to the same value under any secret key. On-chain that state
-/// arrives via a party-to-party `Transfer`, which is proof-gated and out of
-/// reach here, so the test writes it directly.
+/// The remaining assertions are weaker, and labelled as such. The plaintext
+/// fields the program itself computes — public token balance down by exactly the
+/// deposited amount, pending credit counter to 1 and back to 0 — only catch a
+/// deposit that silently did nothing. The decrypted available balance round-trips
+/// this test's own AES ciphertext: it shows that `AeKey` encryption and
+/// decryption agree and that the cheatcode reads the right field, but it does not
+/// bind to the ElGamal key. The post-apply pending read of 0 is a shape check,
+/// not a key check — `ApplyPendingBalance` resets that ciphertext to all-zero,
+/// which decodes to 0 under any key.
 ///
-/// What the rest of the assertions carry: the plaintext fields the program
-/// itself computes — the public token balance falls by exactly the deposited
-/// amount, and the pending credit counter goes to 1 and back to 0 — catch a
-/// deposit that silently did nothing. The decrypted available balance
-/// round-trips this test's own AES ciphertext, so it shows that `AeKey`
-/// encryption and decryption agree and that the cheatcode reads the right
-/// field; it does not bind to the ElGamal key. The post-apply pending read of 0
-/// is a shape check, not a key check: `ApplyPendingBalance` resets the pending
-/// ciphertext to all-zero, which decodes to 0 under any key.
-///
-/// The account is put into its configured state by `surfnet_setTokenAccount`
-/// rather than by an on-chain `ConfigureAccount`, which is proof-gated and so
-/// blocked by the same SDK skew as `Transfer`.
-///
-/// The deposit path is the confidential-balance movement that carries no
-/// zero-knowledge proof. A party-to-party `Transfer` additionally needs proofs
-/// verified by the ZK ElGamal proof program and is not covered here.
+/// The account reaches its configured state via `surfnet_setTokenAccount` rather
+/// than an on-chain `ConfigureAccount`, which is proof-gated; nothing here
+/// establishes whether that instruction would succeed under this harness.
+/// `Deposit` is the confidential-balance movement that carries no zero-knowledge
+/// proof; a party-to-party `Transfer` additionally needs proofs verified by the
+/// ZK ElGamal proof program and is not covered here.
 #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
 #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
 #[test_case(TestType::no_db(); "with no db")]
@@ -11207,12 +11201,15 @@ async fn test_confidential_balance_deposit_round_trip(test_type: TestType) {
         &token_program,
     );
 
-    // Leg 1: derive the owner's confidential keys for this token account.
+    // Leg 1: derive the owner's confidential keys from signatures scoped to this
+    // token account, which are the two messages a confidential client signs.
+    let (elgamal_signature, ae_signature) =
+        crate::types::confidential_key_signatures(&owner, &token_account);
     let keys = rpc_server
         .derive_confidential_keys(
             Some(runloop_context.clone()),
-            bs58::encode(owner.to_bytes()).into_string(),
-            token_account.to_string(),
+            elgamal_signature,
+            ae_signature,
         )
         .expect("deriveConfidentialKeys should succeed")
         .value;
@@ -11503,5 +11500,783 @@ async fn test_confidential_balance_deposit_round_trip(test_type: TestType) {
     assert_eq!(
         after_apply.pending_balance_credit_counter, 0,
         "applying the pending balance resets the credit counter"
+    );
+}
+
+/// **This test is `#[ignore]`d and does not run — nothing described below is
+/// asserted by the suite.** See the `# Why this is ignored` section.
+///
+/// The round trip the confidential cheatcodes exist to support, end to end and
+/// between two parties: derive both owners' keys with
+/// `surfnet_deriveConfidentialKeys`, move value from one to the other with a
+/// real Token-2022 `Transfer`, and read the result on both sides with
+/// `surfnet_getConfidentialBalance`.
+///
+/// Unlike a `Deposit`, which only moves an owner's own public tokens into their
+/// own encrypted pending balance, a `Transfer` moves value between two
+/// accounts entirely under encryption and is gated on three zero-knowledge
+/// proofs verified by the ZK ElGamal proof program: a ciphertext-commitment
+/// equality proof, a batched grouped-ciphertext validity proof, and a batched
+/// range proof. This test builds all three and submits them alongside the
+/// transfer.
+///
+/// What binds the assertions to the derived keys: the amount that lands on the
+/// recipient is decrypted out of the recipient's pending balance with the
+/// recipient's ElGamal secret key. That pending balance is written by the
+/// program from the transfer's ciphertext, under the recipient's ElGamal
+/// public key, so nothing but the matching secret key opens it, and a
+/// stranger's key is asserted to recover nothing. The sender's remaining
+/// available balance is decrypted with the sender's AES key, which shows the
+/// cheatcode reads the right field but does not bind to the derivation, the
+/// same caveat the deposit round trip records.
+///
+/// # Why this is ignored
+///
+/// This does not pass today, and the reason is a version skew in the dependency
+/// graph rather than anything about the cheatcodes. Two different
+/// `solana-zk-sdk` majors are linked at once:
+///
+/// - proof *generation* here resolves to `solana-zk-sdk` 4.0.0, pinned through
+///   `spl-token-2022-interface` -> `spl-pod`;
+/// - the proof *verifier* the runtime actually runs is
+///   `solana-zk-elgamal-proof-program` 4.1.2, pulled in by `litesvm` ->
+///   `solana-builtins`, which is built against `solana-zk-sdk` 5.0.1.
+///
+/// Between those two versions the Fiat-Shamir transcript of the
+/// ciphertext-commitment equality proof changed. 5.0.1 hashes the public
+/// context (ElGamal pubkey, ciphertext, commitment) into the transcript inside
+/// both `CiphertextCommitmentEqualityProof::new` and `::verify`; 4.0.0 hashes
+/// none of it *there*, and documents that the caller is responsible. In 4.0.0
+/// the caller does do it, one layer up in
+/// `CiphertextCommitmentEqualityProofContext::new_transcript`, which also seeds
+/// the transcript with `Transcript::new` where 5.0.1 uses
+/// `Transcript::new_zk_elgamal_transcript`. So both versions absorb the same
+/// context, but at different layers and from a different starting state —
+/// worth being precise about, because "add the missing hash to 4.0.0" is not
+/// the fix it sounds like. Prover and verifier therefore derive different
+/// challenge scalars, and the program rejects the proof with
+/// `proof verification failed: SigmaProof(Equality, AlgebraicRelation)`.
+///
+/// Everything in this section was observed by running the test locally; because
+/// it is ignored, nothing in the suite asserts any of it. In particular, no test
+/// in this change establishes that a confidential `Transfer` completes — the
+/// assertions that would show it never execute. Treat that path as uncovered,
+/// not as working.
+///
+/// Un-ignore this once proof generation and the runtime's proof program agree on
+/// a `solana-zk-sdk` major — either `litesvm` linking a 4.x proof program, or
+/// `spl-token-2022-interface` moving to the 5.x proof stack.
+#[test_case(TestType::no_db(); "with no db")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "see the '# Why this is ignored' section of the doc comment above"]
+async fn test_confidential_balance_transfer_round_trip(test_type: TestType) {
+    use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
+    use spl_token_2022_interface::{
+        extension::confidential_transfer::{
+            ConfidentialTransferAccount, instruction as confidential_instruction,
+        },
+        solana_zk_sdk::encryption::{
+            auth_encryption::{AeCiphertext, AeKey},
+            elgamal::{ElGamalCiphertext, ElGamalKeypair, ElGamalPubkey, ElGamalSecretKey},
+        },
+    };
+    use spl_token_confidential_transfer_proof_extraction::instruction::ProofLocation;
+    use spl_token_confidential_transfer_proof_generation::transfer::transfer_split_proof_data;
+    use surfpool_types::types::{
+        ConfidentialBalanceKeys, ConfidentialTransferAccountUpdate, TokenAccountUpdate,
+    };
+
+    let rpc_server = SurfnetCheatcodesRpc::empty();
+    let (svm_instance, _simnet_events_rx, _geyser_events_rx) = test_type.initialize_svm();
+    let svm_locker = SurfnetSvmLocker::new(svm_instance);
+    let (simnet_cmd_tx, _simnet_cmd_rx) = crossbeam_unbounded::<SimnetCommand>();
+    let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
+    let runloop_context = RunloopContext {
+        id: None,
+        svm_locker: svm_locker.clone(),
+        simnet_commands_tx: simnet_cmd_tx,
+        remote_rpc_client: None,
+        rpc_config: RpcConfig::default(),
+        cheatcode_config: CheatcodeConfig::new(),
+        plugin_commands_tx,
+    };
+
+    let token_program = spl_token_2022_interface::id();
+    let sender = Keypair::new();
+    let recipient = Keypair::new();
+    let mint = Keypair::new();
+    let decimals = 2u8;
+
+    svm_locker
+        .airdrop(&sender.pubkey(), 10 * LAMPORTS_PER_SOL)
+        .unwrap()
+        .unwrap();
+    svm_locker
+        .airdrop(&recipient.pubkey(), 10 * LAMPORTS_PER_SOL)
+        .unwrap()
+        .unwrap();
+
+    let source_account = get_associated_token_address_with_program_id(
+        &sender.pubkey(),
+        &mint.pubkey(),
+        &token_program,
+    );
+    let destination_account = get_associated_token_address_with_program_id(
+        &recipient.pubkey(),
+        &mint.pubkey(),
+        &token_program,
+    );
+
+    // Leg 1: derive both parties' confidential keys through the cheatcode, from
+    // signatures scoped to each party's own token account.
+    let (sender_elgamal_signature, sender_ae_signature) =
+        crate::types::confidential_key_signatures(&sender, &source_account);
+    let sender_keys = rpc_server
+        .derive_confidential_keys(
+            Some(runloop_context.clone()),
+            sender_elgamal_signature,
+            sender_ae_signature,
+        )
+        .expect("deriveConfidentialKeys should succeed for the sender")
+        .value;
+
+    let (recipient_elgamal_signature, recipient_ae_signature) =
+        crate::types::confidential_key_signatures(&recipient, &destination_account);
+    let recipient_keys = rpc_server
+        .derive_confidential_keys(
+            Some(runloop_context.clone()),
+            recipient_elgamal_signature,
+            recipient_ae_signature,
+        )
+        .expect("deriveConfidentialKeys should succeed for the recipient")
+        .value;
+
+    // A mint carrying the confidential-transfer extension.
+    let mint_len =
+        spl_token_2022_interface::extension::ExtensionType::try_calculate_account_len::<
+            spl_token_2022_interface::state::Mint,
+        >(&[spl_token_2022_interface::extension::ExtensionType::ConfidentialTransferMint])
+        .unwrap();
+    let mint_rent =
+        svm_locker.with_svm_reader(|svm| svm.inner.minimum_balance_for_rent_exemption(mint_len));
+
+    let setup_instructions = vec![
+        system_instruction::create_account(
+            &sender.pubkey(),
+            &mint.pubkey(),
+            mint_rent,
+            mint_len as u64,
+            &token_program,
+        ),
+        confidential_instruction::initialize_mint(
+            &token_program,
+            &mint.pubkey(),
+            Some(sender.pubkey()),
+            true,
+            None,
+        )
+        .unwrap(),
+        spl_token_2022_interface::instruction::initialize_mint2(
+            &token_program,
+            &mint.pubkey(),
+            &sender.pubkey(),
+            None,
+            decimals,
+        )
+        .unwrap(),
+    ];
+    let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let setup_message = Message::new_with_blockhash(
+        &setup_instructions,
+        Some(&sender.pubkey()),
+        &recent_blockhash,
+    );
+    let setup_tx =
+        VersionedTransaction::try_new(VersionedMessage::Legacy(setup_message), &[&sender, &mint])
+            .unwrap();
+    let (setup_status_tx, setup_status_rx) = crossbeam_channel::unbounded();
+    svm_locker
+        .process_transaction(&None, setup_tx, setup_status_tx, false, true)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            setup_status_rx.recv().unwrap(),
+            TransactionStatusEvent::Success(_)
+        ),
+        "mint setup should succeed"
+    );
+
+    // Configure both confidential accounts. The sender starts with a real
+    // available balance; the recipient starts empty and receive-only.
+    let sender_start = 5_000u64;
+    rpc_server
+        .set_token_account(
+            Some(runloop_context.clone()),
+            sender.pubkey().to_string(),
+            mint.pubkey().to_string(),
+            TokenAccountUpdate {
+                amount: Some(0),
+                confidential: Some(ConfidentialTransferAccountUpdate {
+                    elgamal_pubkey: sender_keys.elgamal_pubkey.clone(),
+                    aes_key: Some(sender_keys.aes_key.clone()),
+                    amount: Some(sender_start),
+                    approved: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            Some(token_program.to_string()),
+        )
+        .await
+        .expect("setTokenAccount should succeed for the sender");
+
+    rpc_server
+        .set_token_account(
+            Some(runloop_context.clone()),
+            recipient.pubkey().to_string(),
+            mint.pubkey().to_string(),
+            TokenAccountUpdate {
+                amount: Some(0),
+                confidential: Some(ConfidentialTransferAccountUpdate {
+                    elgamal_pubkey: recipient_keys.elgamal_pubkey.clone(),
+                    aes_key: Some(recipient_keys.aes_key.clone()),
+                    amount: Some(0),
+                    approved: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            Some(token_program.to_string()),
+        )
+        .await
+        .expect("setTokenAccount should succeed for the recipient");
+
+    // Rebuild the sender's keys as SDK objects; the proof generation needs the
+    // ElGamal keypair and AES key that the cheatcode just handed back.
+    let sender_elgamal_secret = ElGamalSecretKey::try_from(
+        bs58::decode(&sender_keys.elgamal_secret_key)
+            .into_vec()
+            .unwrap()
+            .as_slice(),
+    )
+    .expect("derived sender elgamalSecretKey should parse");
+    let sender_elgamal_keypair = ElGamalKeypair::new(sender_elgamal_secret);
+    let sender_ae_bytes: [u8; 16] = bs58::decode(&sender_keys.aes_key)
+        .into_vec()
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let sender_ae_key = AeKey::from(sender_ae_bytes);
+    let recipient_elgamal_pubkey = ElGamalPubkey::try_from(
+        bs58::decode(&recipient_keys.elgamal_pubkey)
+            .into_vec()
+            .unwrap()
+            .as_slice(),
+    )
+    .expect("derived recipient elgamalPubkey should parse");
+
+    // Read the sender's on-account ciphertexts back out; the proofs are built
+    // against exactly the state the program will do its homomorphic math on.
+    let (current_available_balance, current_decryptable_available_balance) = {
+        let account = svm_locker
+            .with_svm_reader(|svm| svm.inner.get_account(&source_account).unwrap())
+            .expect("source token account should exist");
+        let state =
+            StateWithExtensions::<spl_token_2022_interface::state::Account>::unpack(&account.data)
+                .expect("source account should unpack with extensions");
+        let ext = state
+            .get_extension::<ConfidentialTransferAccount>()
+            .expect("confidential extension should be present");
+        (
+            ElGamalCiphertext::try_from(ext.available_balance)
+                .expect("available balance should be a valid ElGamal ciphertext"),
+            AeCiphertext::try_from(ext.decryptable_available_balance)
+                .expect("decryptable available balance should be a valid AES ciphertext"),
+        )
+    };
+
+    // Leg 2: build the three zero-knowledge proofs a real transfer requires and
+    // submit them with the transfer itself.
+    let transfer_amount = 1_250u64;
+    let proof_data = transfer_split_proof_data(
+        &current_available_balance,
+        &current_decryptable_available_balance,
+        transfer_amount,
+        &sender_elgamal_keypair,
+        &sender_ae_key,
+        &recipient_elgamal_pubkey,
+        None,
+    )
+    .expect("transfer proof generation should succeed");
+
+    let new_source_decryptable_available_balance =
+        sender_ae_key.encrypt(sender_start - transfer_amount).into();
+
+    let transfer_instructions = confidential_instruction::transfer(
+        &token_program,
+        &source_account,
+        &mint.pubkey(),
+        &destination_account,
+        &new_source_decryptable_available_balance,
+        &proof_data
+            .ciphertext_validity_proof_data_with_ciphertext
+            .ciphertext_lo,
+        &proof_data
+            .ciphertext_validity_proof_data_with_ciphertext
+            .ciphertext_hi,
+        &sender.pubkey(),
+        &[],
+        ProofLocation::InstructionOffset(1.try_into().unwrap(), &proof_data.equality_proof_data),
+        ProofLocation::InstructionOffset(
+            2.try_into().unwrap(),
+            &proof_data
+                .ciphertext_validity_proof_data_with_ciphertext
+                .proof_data,
+        ),
+        ProofLocation::InstructionOffset(3.try_into().unwrap(), &proof_data.range_proof_data),
+    )
+    .expect("building the transfer instructions should succeed");
+
+    let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let transfer_message = Message::new_with_blockhash(
+        &transfer_instructions,
+        Some(&sender.pubkey()),
+        &recent_blockhash,
+    );
+    let transfer_tx =
+        VersionedTransaction::try_new(VersionedMessage::Legacy(transfer_message), &[&sender])
+            .unwrap();
+    let (transfer_status_tx, transfer_status_rx) = crossbeam_channel::unbounded();
+    svm_locker
+        .process_transaction(&None, transfer_tx, transfer_status_tx, false, true)
+        .await
+        .unwrap();
+    let transfer_status = transfer_status_rx.recv().unwrap();
+    assert!(
+        matches!(transfer_status, TransactionStatusEvent::Success(_)),
+        "the confidential transfer should succeed, got {:?}",
+        transfer_status
+    );
+
+    // Leg 3: read both sides back through the cheatcode.
+    //
+    // The sender's remaining available balance is the AES-decryptable field the
+    // transfer rewrote.
+    let sender_after = rpc_server
+        .get_confidential_balance(
+            Some(runloop_context.clone()),
+            source_account.to_string(),
+            ConfidentialBalanceKeys {
+                aes_key: Some(sender_keys.aes_key.clone()),
+                elgamal_secret_key: Some(sender_keys.elgamal_secret_key.clone()),
+            },
+        )
+        .await
+        .expect("getConfidentialBalance should succeed for the sender")
+        .value;
+    assert_eq!(
+        sender_after.available,
+        Some(sender_start - transfer_amount),
+        "the sender's available balance should fall by exactly the transferred amount"
+    );
+
+    // The recipient's side is the real proof that value moved under encryption:
+    // the program wrote the transfer ciphertext into the recipient's pending
+    // balance under the recipient's ElGamal public key.
+    let recipient_after = rpc_server
+        .get_confidential_balance(
+            Some(runloop_context.clone()),
+            destination_account.to_string(),
+            ConfidentialBalanceKeys {
+                aes_key: Some(recipient_keys.aes_key.clone()),
+                elgamal_secret_key: Some(recipient_keys.elgamal_secret_key.clone()),
+            },
+        )
+        .await
+        .expect("getConfidentialBalance should succeed for the recipient")
+        .value;
+    assert_eq!(
+        recipient_after.pending,
+        Some(transfer_amount),
+        "the transferred amount should decrypt out of the recipient's pending balance"
+    );
+    assert_eq!(
+        recipient_after.pending_balance_credit_counter, 1,
+        "the transfer should register exactly one pending credit on the recipient"
+    );
+
+    // A stranger's ElGamal key must not open the recipient's pending balance.
+    let foreign_elgamal = ElGamalKeypair::new_rand();
+    let pending_under_foreign = rpc_server
+        .get_confidential_balance(
+            Some(runloop_context.clone()),
+            destination_account.to_string(),
+            ConfidentialBalanceKeys {
+                aes_key: None,
+                elgamal_secret_key: Some(
+                    bs58::encode(<[u8; 32]>::from(foreign_elgamal.secret())).into_string(),
+                ),
+            },
+        )
+        .await
+        .map(|response| response.value.pending)
+        .unwrap_or(None);
+    assert_eq!(
+        pending_under_foreign, None,
+        "a foreign ElGamal secret key must not open the recipient's pending balance"
+    );
+}
+
+/// The closest thing to a two-party confidential round trip this simnet can
+/// execute: derive both owners' keys with `surfnet_deriveConfidentialKeys`, move
+/// tokens with a plaintext Token-2022 transfer, have the recipient credit them
+/// to their confidential balance with a real `Deposit` and `ApplyPendingBalance`,
+/// and read the result back with `surfnet_getConfidentialBalance`. The value
+/// crosses between the owners in the clear and only becomes confidential on the
+/// recipient's side; a confidential `Transfer` moves it entirely under encryption
+/// and is gated on proofs this build cannot verify — see
+/// `test_confidential_balance_transfer_round_trip`.
+///
+/// Two `surfnet_setTokenAccount` calls stage both accounts into a configured
+/// confidential state, standing in for the proof-gated on-chain
+/// `ConfigureAccount`; the transfer, `Deposit` and `ApplyPendingBalance` after it
+/// are executed by the Token-2022 program. The assertions establish that the
+/// cheatcode derives distinct keys for two owners and that the recipient's
+/// derived AES key opens the recipient's available balance while the sender's
+/// does not. That read round-trips this test's own `AeKey::encrypt`, because
+/// `ApplyPendingBalance` stores the ciphertext its caller hands it — the same
+/// caveat the sibling deposit test carries.
+#[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+#[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+#[test_case(TestType::no_db(); "with no db")]
+#[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_confidential_balance_plaintext_transfer_then_deposit(test_type: TestType) {
+    use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
+    use spl_token_2022_interface::{
+        extension::confidential_transfer::instruction as confidential_instruction,
+        solana_zk_sdk::encryption::{
+            auth_encryption::AeKey, pod::auth_encryption::PodAeCiphertext,
+        },
+    };
+    use surfpool_types::types::{
+        ConfidentialBalanceKeys, ConfidentialTransferAccountUpdate, TokenAccountUpdate,
+    };
+
+    let rpc_server = SurfnetCheatcodesRpc::empty();
+    let (svm_instance, _simnet_events_rx, _geyser_events_rx) = test_type.initialize_svm();
+    let svm_locker = SurfnetSvmLocker::new(svm_instance);
+    let (simnet_cmd_tx, _simnet_cmd_rx) = crossbeam_unbounded::<SimnetCommand>();
+    let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
+    let runloop_context = RunloopContext {
+        id: None,
+        svm_locker: svm_locker.clone(),
+        simnet_commands_tx: simnet_cmd_tx,
+        remote_rpc_client: None,
+        rpc_config: RpcConfig::default(),
+        cheatcode_config: CheatcodeConfig::new(),
+        plugin_commands_tx,
+    };
+
+    let token_program = spl_token_2022_interface::id();
+    let sender = Keypair::new();
+    let recipient = Keypair::new();
+    let mint = Keypair::new();
+    let decimals = 2u8;
+
+    svm_locker
+        .airdrop(&sender.pubkey(), 10 * LAMPORTS_PER_SOL)
+        .unwrap()
+        .unwrap();
+    svm_locker
+        .airdrop(&recipient.pubkey(), 10 * LAMPORTS_PER_SOL)
+        .unwrap()
+        .unwrap();
+
+    let source_account = get_associated_token_address_with_program_id(
+        &sender.pubkey(),
+        &mint.pubkey(),
+        &token_program,
+    );
+    let destination_account = get_associated_token_address_with_program_id(
+        &recipient.pubkey(),
+        &mint.pubkey(),
+        &token_program,
+    );
+
+    // Leg 1: derive both owners' confidential keys through the cheatcode, each
+    // from signatures scoped to that owner's own token account.
+    let (sender_elgamal_signature, sender_ae_signature) =
+        crate::types::confidential_key_signatures(&sender, &source_account);
+    let sender_keys = rpc_server
+        .derive_confidential_keys(
+            Some(runloop_context.clone()),
+            sender_elgamal_signature,
+            sender_ae_signature,
+        )
+        .expect("deriveConfidentialKeys should succeed for the sender")
+        .value;
+
+    let (recipient_elgamal_signature, recipient_ae_signature) =
+        crate::types::confidential_key_signatures(&recipient, &destination_account);
+    let recipient_keys = rpc_server
+        .derive_confidential_keys(
+            Some(runloop_context.clone()),
+            recipient_elgamal_signature,
+            recipient_ae_signature,
+        )
+        .expect("deriveConfidentialKeys should succeed for the recipient")
+        .value;
+    assert_ne!(
+        sender_keys.elgamal_pubkey, recipient_keys.elgamal_pubkey,
+        "two owners must not derive the same confidential keys"
+    );
+
+    // A mint carrying the confidential-transfer extension.
+    let mint_len =
+        spl_token_2022_interface::extension::ExtensionType::try_calculate_account_len::<
+            spl_token_2022_interface::state::Mint,
+        >(&[spl_token_2022_interface::extension::ExtensionType::ConfidentialTransferMint])
+        .unwrap();
+    let mint_rent =
+        svm_locker.with_svm_reader(|svm| svm.inner.minimum_balance_for_rent_exemption(mint_len));
+
+    let setup_instructions = vec![
+        system_instruction::create_account(
+            &sender.pubkey(),
+            &mint.pubkey(),
+            mint_rent,
+            mint_len as u64,
+            &token_program,
+        ),
+        confidential_instruction::initialize_mint(
+            &token_program,
+            &mint.pubkey(),
+            Some(sender.pubkey()),
+            true,
+            None,
+        )
+        .unwrap(),
+        spl_token_2022_interface::instruction::initialize_mint2(
+            &token_program,
+            &mint.pubkey(),
+            &sender.pubkey(),
+            None,
+            decimals,
+        )
+        .unwrap(),
+    ];
+    let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let setup_message = Message::new_with_blockhash(
+        &setup_instructions,
+        Some(&sender.pubkey()),
+        &recent_blockhash,
+    );
+    let setup_tx =
+        VersionedTransaction::try_new(VersionedMessage::Legacy(setup_message), &[&sender, &mint])
+            .unwrap();
+    let (setup_status_tx, setup_status_rx) = crossbeam_channel::unbounded();
+    svm_locker
+        .process_transaction(&None, setup_tx, setup_status_tx, false, true)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            setup_status_rx.recv().unwrap(),
+            TransactionStatusEvent::Success(_)
+        ),
+        "mint setup should succeed"
+    );
+
+    // Both owners get a configured confidential account. The sender holds the
+    // public tokens to begin with; the recipient starts empty on both sides.
+    let sender_start = 9_000u64;
+    for (owner, keys, amount) in [
+        (&sender, &sender_keys, sender_start),
+        (&recipient, &recipient_keys, 0),
+    ] {
+        rpc_server
+            .set_token_account(
+                Some(runloop_context.clone()),
+                owner.pubkey().to_string(),
+                mint.pubkey().to_string(),
+                TokenAccountUpdate {
+                    amount: Some(amount),
+                    confidential: Some(ConfidentialTransferAccountUpdate {
+                        elgamal_pubkey: keys.elgamal_pubkey.clone(),
+                        aes_key: Some(keys.aes_key.clone()),
+                        amount: Some(0),
+                        approved: Some(true),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                Some(token_program.to_string()),
+            )
+            .await
+            .expect("setTokenAccount should succeed");
+    }
+
+    // Leg 2: a real party-to-party token transfer, executed by Token-2022.
+    let moved_amount = 2_500u64;
+    let transfer_ix = spl_token_2022_interface::instruction::transfer_checked(
+        &token_program,
+        &source_account,
+        &mint.pubkey(),
+        &destination_account,
+        &sender.pubkey(),
+        &[],
+        moved_amount,
+        decimals,
+    )
+    .unwrap();
+    let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let transfer_message =
+        Message::new_with_blockhash(&[transfer_ix], Some(&sender.pubkey()), &recent_blockhash);
+    let transfer_tx =
+        VersionedTransaction::try_new(VersionedMessage::Legacy(transfer_message), &[&sender])
+            .unwrap();
+    let (transfer_status_tx, transfer_status_rx) = crossbeam_channel::unbounded();
+    svm_locker
+        .process_transaction(&None, transfer_tx, transfer_status_tx, false, true)
+        .await
+        .unwrap();
+    let transfer_status = transfer_status_rx.recv().unwrap();
+    assert!(
+        matches!(transfer_status, TransactionStatusEvent::Success(_)),
+        "the party-to-party token transfer should succeed, got {:?}",
+        transfer_status
+    );
+
+    // Leg 3: the recipient credits what they received to their own confidential
+    // balance, then applies it so it lands in the available balance.
+    let deposit_ix = confidential_instruction::deposit(
+        &token_program,
+        &destination_account,
+        &mint.pubkey(),
+        moved_amount,
+        decimals,
+        &recipient.pubkey(),
+        &[],
+    )
+    .unwrap();
+    let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let deposit_message =
+        Message::new_with_blockhash(&[deposit_ix], Some(&recipient.pubkey()), &recent_blockhash);
+    let deposit_tx =
+        VersionedTransaction::try_new(VersionedMessage::Legacy(deposit_message), &[&recipient])
+            .unwrap();
+    let (deposit_status_tx, deposit_status_rx) = crossbeam_channel::unbounded();
+    svm_locker
+        .process_transaction(&None, deposit_tx, deposit_status_tx, false, true)
+        .await
+        .unwrap();
+    let deposit_status = deposit_status_rx.recv().unwrap();
+    assert!(
+        matches!(deposit_status, TransactionStatusEvent::Success(_)),
+        "the recipient's confidential deposit should succeed, got {:?}",
+        deposit_status
+    );
+
+    let recipient_ae_bytes: [u8; 16] = bs58::decode(&recipient_keys.aes_key)
+        .into_vec()
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let new_available =
+        PodAeCiphertext::from(AeKey::from(recipient_ae_bytes).encrypt(moved_amount));
+    let apply_ix = confidential_instruction::apply_pending_balance(
+        &token_program,
+        &destination_account,
+        1,
+        &new_available,
+        &recipient.pubkey(),
+        &[],
+    )
+    .unwrap();
+    let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let apply_message =
+        Message::new_with_blockhash(&[apply_ix], Some(&recipient.pubkey()), &recent_blockhash);
+    let apply_tx =
+        VersionedTransaction::try_new(VersionedMessage::Legacy(apply_message), &[&recipient])
+            .unwrap();
+    let (apply_status_tx, apply_status_rx) = crossbeam_channel::unbounded();
+    svm_locker
+        .process_transaction(&None, apply_tx, apply_status_tx, false, true)
+        .await
+        .unwrap();
+    let apply_status = apply_status_rx.recv().unwrap();
+    assert!(
+        matches!(apply_status, TransactionStatusEvent::Success(_)),
+        "applying the recipient's pending balance should succeed, got {:?}",
+        apply_status
+    );
+
+    // Leg 4: read the recipient's confidential balance back through the
+    // cheatcode, under the keys the cheatcode derived for the recipient.
+    let recipient_balance = rpc_server
+        .get_confidential_balance(
+            Some(runloop_context.clone()),
+            destination_account.to_string(),
+            ConfidentialBalanceKeys {
+                aes_key: Some(recipient_keys.aes_key.clone()),
+                elgamal_secret_key: Some(recipient_keys.elgamal_secret_key.clone()),
+            },
+        )
+        .await
+        .expect("getConfidentialBalance should succeed for the recipient")
+        .value;
+    assert_eq!(
+        recipient_balance.available,
+        Some(moved_amount),
+        "the recipient's confidential available balance should hold what was transferred"
+    );
+
+    // The recipient's own AES key opens that balance; the sender's does not.
+    // AES-GCM-SIV authenticates, so a wrong key fails rather than decoding to
+    // some other number.
+    let available_under_sender_key = rpc_server
+        .get_confidential_balance(
+            Some(runloop_context.clone()),
+            destination_account.to_string(),
+            ConfidentialBalanceKeys {
+                aes_key: Some(sender_keys.aes_key.clone()),
+                elgamal_secret_key: None,
+            },
+        )
+        .await
+        .map(|response| response.value.available)
+        .unwrap_or(None);
+    assert_eq!(
+        available_under_sender_key, None,
+        "the sender's AES key must not open the recipient's confidential balance"
+    );
+
+    // The public ledger agrees: the tokens left the sender and are now held
+    // confidentially by the recipient rather than sitting in the clear.
+    let source_state = svm_locker
+        .with_svm_reader(|svm| svm.inner.get_account(&source_account).unwrap())
+        .expect("source token account should exist");
+    let source_state =
+        StateWithExtensions::<spl_token_2022_interface::state::Account>::unpack(&source_state.data)
+            .expect("source account should unpack with extensions");
+    assert_eq!(
+        source_state.base.amount,
+        sender_start - moved_amount,
+        "the sender's public balance should fall by the transferred amount"
+    );
+
+    let destination_state = svm_locker
+        .with_svm_reader(|svm| svm.inner.get_account(&destination_account).unwrap())
+        .expect("destination token account should exist");
+    let destination_state =
+        StateWithExtensions::<spl_token_2022_interface::state::Account>::unpack(
+            &destination_state.data,
+        )
+        .expect("destination account should unpack with extensions");
+    assert_eq!(
+        destination_state.base.amount, 0,
+        "the recipient's public balance should be empty once deposited confidentially"
     );
 }

@@ -6,4 +6,8 @@ import type { UiAccount } from "./UiAccount.js";
 /**
  * Mirrors [`crate::types::UiAccountChange`], with [`UiAccountDef`] payloads.
  */
-export type UiAccountChange = { "type": "create", "data": UiAccount } | { "type": "update", "data": [UiAccount, UiAccount] } | { "type": "delete", "data": UiAccount } | { "type": "unchanged", "data": UiAccount | null };
+export type UiAccountChange =
+  | { type: "create"; data: UiAccount }
+  | { type: "update"; data: [UiAccount, UiAccount] }
+  | { type: "delete"; data: UiAccount }
+  | { type: "unchanged"; data: UiAccount | null };

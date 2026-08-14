@@ -6,4 +6,11 @@ import type { UiAccountData } from "./UiAccountData.js";
 /**
  * Mirrors [`solana_account_decoder_client_types::UiAccount`].
  */
-export type UiAccount = { lamports: bigint, data: UiAccountData, owner: string, executable: boolean, rentEpoch: bigint, space: bigint | null, };
+export type UiAccount = {
+  lamports: bigint;
+  data: UiAccountData;
+  owner: string;
+  executable: boolean;
+  rentEpoch: bigint;
+  space: bigint | null;
+};

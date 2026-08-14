@@ -118,7 +118,7 @@ export type SurfnetGetConfidentialBalanceApi = {
     getConfidentialBalance(tokenAccount: Address, keys: ConfidentialBalanceKeys): GetConfidentialBalanceResponse;
 };
 export type SurfnetDeriveConfidentialKeysApi = {
-    deriveConfidentialKeys(keypair: string, tokenAccount: Address): DeriveConfidentialKeysResponse;
+    deriveConfidentialKeys(elgamalSignature: string, aeSignature: string): DeriveConfidentialKeysResponse;
 };
 export type SurfnetResetAccountApi = {
     resetAccount(pubkey: Address, config?: ResetAccountConfig): null;

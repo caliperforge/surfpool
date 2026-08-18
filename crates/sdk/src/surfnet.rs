@@ -43,6 +43,7 @@ use crate::{
 pub struct SurfnetBuilder {
     offline_mode: bool,
     remote_rpc_url: Option<String>,
+    allow_insecure_remote_tls: bool,
     block_production_mode: BlockProductionMode,
     slot_time_ms: u64,
     airdrop_addresses: Vec<Pubkey>,
@@ -57,6 +58,7 @@ impl Default for SurfnetBuilder {
         Self {
             offline_mode: true,
             remote_rpc_url: None,
+            allow_insecure_remote_tls: false,
             block_production_mode: BlockProductionMode::Transaction,
             slot_time_ms: 1,
             airdrop_addresses: vec![],
@@ -79,6 +81,18 @@ impl SurfnetBuilder {
     pub fn remote_rpc_url(mut self, url: impl Into<String>) -> Self {
         self.remote_rpc_url = Some(url.into());
         self.offline_mode = false;
+        self
+    }
+
+    /// Accept the datasource's TLS certificate without verifying it, for a
+    /// datasource behind a self-signed cert. Mirrors the CLI's
+    /// `--allow-insecure-remote-tls` flag. Default: `false`.
+    ///
+    /// Anyone able to intercept the connection can then impersonate the
+    /// datasource, and the accounts it serves are written into the local bank,
+    /// executable program bytecode included.
+    pub fn allow_insecure_remote_tls(mut self, allow: bool) -> Self {
+        self.allow_insecure_remote_tls = allow;
         self
     }
 
@@ -137,44 +151,49 @@ impl SurfnetBuilder {
         self
     }
 
-    /// Start the surfnet with the configured options.
-    pub async fn start(self) -> SurfnetResult<Surfnet> {
-        let SurfnetBuilder {
-            offline_mode,
-            remote_rpc_url,
-            block_production_mode,
-            slot_time_ms,
+    /// The [`SimnetConfig`] this builder hands to the runloop. Split out of
+    /// `start` so a setter can be checked against the config the runloop
+    /// actually receives, without binding ports and starting a surfnet.
+    fn simnet_config(&self, airdrop_addresses: Vec<Pubkey>) -> SimnetConfig {
+        SimnetConfig {
+            offline_mode: self.offline_mode,
+            remote_rpc_url: self.remote_rpc_url.clone(),
+            allow_insecure_remote_tls: self.allow_insecure_remote_tls,
+            slot_time: self.slot_time_ms,
+            block_production_mode: self.block_production_mode.clone(),
             airdrop_addresses,
-            airdrop_lamports,
-            skip_blockhash_check,
-            payer,
-            feature_config,
-        } = self;
-        let payer = payer.unwrap_or_else(Keypair::new);
+            airdrop_token_amount: self.airdrop_lamports,
+            skip_blockhash_check: self.skip_blockhash_check,
+            ..Default::default()
+        }
+    }
+
+    /// Start the surfnet with the configured options.
+    pub async fn start(mut self) -> SurfnetResult<Surfnet> {
+        let payer = self.payer.take().unwrap_or_else(Keypair::new);
 
         let bind_port = get_free_port()?;
         let ws_port = get_free_port()?;
         let bind_host = "127.0.0.1".to_string();
 
         let mut startup_airdrop_addresses = vec![payer.pubkey()];
-        startup_airdrop_addresses.extend(airdrop_addresses);
+        startup_airdrop_addresses.append(&mut self.airdrop_addresses);
         let startup_airdrop_addresses_for_rpc = startup_airdrop_addresses.clone();
+
+        let simnet_config = self.simnet_config(startup_airdrop_addresses);
+        let SurfnetBuilder {
+            airdrop_lamports,
+            skip_blockhash_check,
+            feature_config,
+            ..
+        } = self;
 
         // The default StartupPlanner::Runloop makes the runloop seal an empty
         // startup plan before announcing Ready, so wait_for_ready below
         // implies a publicly ready surfnet (getSurfnetInfo reports phase
         // ready with no pending compat entry).
         let surfpool_config = SurfpoolConfig {
-            simnets: vec![SimnetConfig {
-                offline_mode,
-                remote_rpc_url,
-                slot_time: slot_time_ms,
-                block_production_mode,
-                airdrop_addresses: startup_airdrop_addresses,
-                airdrop_token_amount: airdrop_lamports,
-                skip_blockhash_check,
-                ..Default::default()
-            }],
+            simnets: vec![simnet_config],
             rpc: RpcConfig {
                 bind_host: bind_host.clone(),
                 bind_port,
@@ -467,5 +486,22 @@ mod tests {
     fn surfnet_builder_skip_blockhash_check_setter_updates_builder() {
         let builder = SurfnetBuilder::default().skip_blockhash_check(true);
         assert!(builder.skip_blockhash_check);
+    }
+
+    // The runloop reads allow_insecure_remote_tls off the SimnetConfig it is
+    // handed, so the builder field alone proves nothing: these assert the value
+    // in the config that reaches the runloop.
+    #[test]
+    fn surfnet_builder_allow_insecure_remote_tls_defaults_to_false_in_simnet_config() {
+        let config = SurfnetBuilder::default().simnet_config(vec![]);
+        assert!(!config.allow_insecure_remote_tls);
+    }
+
+    #[test]
+    fn surfnet_builder_allow_insecure_remote_tls_reaches_simnet_config() {
+        let config = SurfnetBuilder::default()
+            .allow_insecure_remote_tls(true)
+            .simnet_config(vec![]);
+        assert!(config.allow_insecure_remote_tls);
     }
 }

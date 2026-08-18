@@ -30,6 +30,14 @@ pub struct StartSurfnetParams {
         description = "If `false` (default), returns a command for the AI to execute. If `true`, starts surfnet directly as a background process."
     )]
     pub run_as_subprocess: bool,
+    /// Omitted by every client that predates this field, which is why it
+    /// defaults rather than being required: a caller who says nothing keeps
+    /// certificate verification.
+    #[serde(default)]
+    #[schemars(
+        description = "If `true`, accept the datasource's TLS certificate without verifying it, for a datasource behind a self-signed cert. Defaults to `false`. Anyone able to intercept the connection can then impersonate the datasource, and the accounts it serves are written into the local bank, executable program bytecode included."
+    )]
+    pub allow_insecure_remote_tls: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -368,8 +376,18 @@ impl Surfpool {
         };
 
         let res = match params.run_as_subprocess {
-            true => start_surfnet::run_headless(surfnet_id, port, port.saturating_sub(9)),
-            false => start_surfnet::run_command(surfnet_id, port, port.saturating_sub(9)),
+            true => start_surfnet::run_headless(
+                surfnet_id,
+                port,
+                port.saturating_sub(9),
+                params.allow_insecure_remote_tls,
+            ),
+            false => start_surfnet::run_command(
+                surfnet_id,
+                port,
+                port.saturating_sub(9),
+                params.allow_insecure_remote_tls,
+            ),
         };
 
         // Keep track of the surfnet instance in the registry
@@ -447,7 +465,9 @@ impl Surfpool {
             }
         };
 
-        let start_response = start_surfnet::run_headless(surfnet_id, port, port.saturating_sub(9));
+        // This tool exposes no TLS parameter, so it keeps certificate verification.
+        let start_response =
+            start_surfnet::run_headless(surfnet_id, port, port.saturating_sub(9), false);
 
         let surfnet_url = match start_response.success {
             Some(ref success_data) => {

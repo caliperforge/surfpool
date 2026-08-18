@@ -56,17 +56,25 @@ impl StartSurfnetResponse {
     }
 }
 
-pub fn generate_command(rpc_port: u16, ws_port: u16) -> Command {
+pub fn generate_command(rpc_port: u16, ws_port: u16, allow_insecure_remote_tls: bool) -> Command {
     let mut cmd = Command::new("surfpool");
     cmd.arg("start");
     cmd.arg("--port").arg(format!("{}", rpc_port));
     cmd.arg("--ws-port").arg(format!("{}", ws_port));
     cmd.arg("--no-deploy");
+    if allow_insecure_remote_tls {
+        cmd.arg("--allow-insecure-remote-tls");
+    }
     cmd
 }
 
-pub fn run_command(surfnet_id: u16, rpc_port: u16, ws_port: u16) -> StartSurfnetResponse {
-    let command = generate_command(rpc_port, ws_port);
+pub fn run_command(
+    surfnet_id: u16,
+    rpc_port: u16,
+    ws_port: u16,
+    allow_insecure_remote_tls: bool,
+) -> StartSurfnetResponse {
+    let command = generate_command(rpc_port, ws_port, allow_insecure_remote_tls);
     let surfnet_url = format!("http://127.0.0.1:{}", rpc_port);
 
     StartSurfnetResponse::success(StartSurfnetSuccess {
@@ -76,7 +84,23 @@ pub fn run_command(surfnet_id: u16, rpc_port: u16, ws_port: u16) -> StartSurfnet
     })
 }
 
-pub fn run_headless(surfnet_id: u16, rpc_port: u16, ws_port: u16) -> StartSurfnetResponse {
+/// The [`SimnetConfig`] a headless surfnet starts with. Split out of
+/// `run_headless` so the tool's parameters can be checked against the config the
+/// runloop actually receives, without binding ports and starting a surfnet.
+fn simnet_config(allow_insecure_remote_tls: bool) -> SimnetConfig {
+    SimnetConfig {
+        expiry: Some(15 * 60 * 1000),
+        allow_insecure_remote_tls,
+        ..Default::default()
+    }
+}
+
+pub fn run_headless(
+    surfnet_id: u16,
+    rpc_port: u16,
+    ws_port: u16,
+    allow_insecure_remote_tls: bool,
+) -> StartSurfnetResponse {
     let (surfnet_svm, simnet_events_rx, geyser_events_rx) = SurfnetSvm::default();
 
     let (simnet_commands_tx, simnet_commands_rx) = crossbeam_channel::unbounded();
@@ -90,12 +114,7 @@ pub fn run_headless(surfnet_id: u16, rpc_port: u16, ws_port: u16) -> StartSurfne
     config.rpc.bind_port = rpc_port;
     config.rpc.ws_port = ws_port;
 
-    let simnet_config = SimnetConfig {
-        expiry: Some(15 * 60 * 1000),
-        ..Default::default()
-    };
-
-    config.simnets = vec![simnet_config];
+    config.simnets = vec![simnet_config(allow_insecure_remote_tls)];
 
     let handle = hiro_system_kit::thread_named("surfnet").spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -255,7 +274,7 @@ mod tests {
         let rpc_port = free_port();
         let ws_port = free_port();
 
-        let response = run_headless(1, rpc_port, ws_port);
+        let response = run_headless(1, rpc_port, ws_port, false);
         assert!(
             response.error.is_none(),
             "surfnet failed to start: {:?}",
@@ -278,5 +297,32 @@ mod tests {
             0,
             "no compat entry should remain once startup is ready: {info}"
         );
+    }
+
+    // The runloop reads allow_insecure_remote_tls off the SimnetConfig it is
+    // handed, so the tool parameter alone proves nothing: these assert the
+    // value in the config that reaches the runloop.
+    #[test]
+    fn headless_simnet_config_verifies_tls_by_default() {
+        assert!(!simnet_config(false).allow_insecure_remote_tls);
+    }
+
+    #[test]
+    fn headless_simnet_config_carries_the_tls_opt_in() {
+        assert!(simnet_config(true).allow_insecure_remote_tls);
+    }
+
+    #[test]
+    fn generated_command_omits_the_tls_flag_unless_asked() {
+        let cmd = generate_command(8899, 8900, false);
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy()).collect();
+        assert!(!args.iter().any(|a| a == "--allow-insecure-remote-tls"));
+    }
+
+    #[test]
+    fn generated_command_carries_the_tls_flag_when_asked() {
+        let cmd = generate_command(8899, 8900, true);
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy()).collect();
+        assert!(args.iter().any(|a| a == "--allow-insecure-remote-tls"));
     }
 }

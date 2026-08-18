@@ -1156,6 +1156,30 @@ impl ServerHandler for Surfpool {
 mod tests {
     use super::*;
 
+    // The tool's advertised schema is the only thing an MCP client can see, so
+    // this is what "the entrypoint exposes the opt-in" actually means.
+    #[test]
+    fn start_surfnet_tool_exposes_the_tls_opt_in() {
+        let schema = serde_json::to_value(schemars::schema_for!(StartSurfnetParams))
+            .expect("schema serializes");
+        let properties = schema["properties"]
+            .as_object()
+            .expect("schema has properties");
+        assert!(
+            properties.contains_key("allow_insecure_remote_tls"),
+            "{properties:?}"
+        );
+        // Not in `required`: a client that predates the field still validates.
+        assert!(
+            !schema["required"]
+                .as_array()
+                .expect("schema has required")
+                .iter()
+                .any(|f| f == "allow_insecure_remote_tls"),
+            "{schema}"
+        );
+    }
+
     #[test]
     fn search_takes_its_template_id_the_way_the_response_names_it() {
         let schema = serde_json::to_value(schemars::schema_for!(SearchConstantOptionsParams))

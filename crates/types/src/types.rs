@@ -845,6 +845,14 @@ pub enum StartupPlanner {
 pub struct SimnetConfig {
     pub offline_mode: bool,
     pub remote_rpc_url: Option<String>,
+    /// Accept the datasource's TLS certificate without verifying it, for a
+    /// datasource behind a self-signed cert.
+    ///
+    /// Off unless the operator asks for it. An unverified datasource can be
+    /// impersonated by anyone on the path to it, and the accounts it serves are
+    /// written into the local bank, executable bytecode included.
+    #[serde(default)]
+    pub allow_insecure_remote_tls: bool,
     pub slot_time: u64,
     pub block_production_mode: BlockProductionMode,
     pub airdrop_addresses: Vec<Pubkey>,
@@ -869,6 +877,7 @@ impl Default for SimnetConfig {
         Self {
             offline_mode: false,
             remote_rpc_url: Some(DEFAULT_MAINNET_RPC_URL.to_string()),
+            allow_insecure_remote_tls: false,
             slot_time: DEFAULT_SLOT_TIME_MS, // Default to 400ms to match CLI default
             block_production_mode: BlockProductionMode::Clock,
             airdrop_addresses: vec![],
@@ -2295,6 +2304,23 @@ mod tests {
 
         let config: SimnetConfig = serde_json::from_value(config_json).unwrap();
         assert!(!config.skip_blockhash_check);
+    }
+
+    // The datasource's certificate is verified unless the operator asks
+    // otherwise, and a config written before the field existed asks for
+    // nothing.
+    #[test]
+    fn test_simnet_config_allow_insecure_remote_tls_defaults_off() {
+        assert!(!SimnetConfig::default().allow_insecure_remote_tls);
+
+        let mut config_json = serde_json::to_value(SimnetConfig::default()).unwrap();
+        config_json
+            .as_object_mut()
+            .unwrap()
+            .remove("allow_insecure_remote_tls");
+
+        let config: SimnetConfig = serde_json::from_value(config_json).unwrap();
+        assert!(!config.allow_insecure_remote_tls);
     }
 
     // Configs written before the startup planner existed must keep working;

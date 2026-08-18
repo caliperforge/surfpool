@@ -121,7 +121,11 @@ impl SurfpoolRpcClient {
 
     /// A variant that accepts invalid TLS certificates, for datasources
     /// behind self-signed certs.
-    fn new_unsafe<U: ToString>(remote_rpc_url: U) -> Option<Self> {
+    ///
+    /// Reached only where the operator asked for it. Certificate verification
+    /// is what establishes that the datasource on the other end is the one that
+    /// was asked for, so a client built here trusts whoever answers.
+    fn new_insecure<U: ToString>(remote_rpc_url: U) -> Option<Self> {
         use reqwest;
 
         // Construction can fail after a fork (the daemonize path), so a
@@ -148,14 +152,29 @@ impl SurfpoolRpcClient {
     }
 }
 
+/// Whether the datasource's TLS certificate gets verified.
+///
+/// Recorded on the client because [`Clone`] has nothing but `&self` to rebuild
+/// from: a posture that is not stored is a posture a clone cannot keep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DatasourceTls {
+    Verified,
+    /// The operator opted in, per [`SurfpoolRpcClient::new_insecure`].
+    Insecure,
+}
+
 pub struct SurfnetRemoteClient {
     pub client: RpcClient,
+    tls: DatasourceTls,
 }
 impl Clone for SurfnetRemoteClient {
     fn clone(&self) -> Self {
         let remote_rpc_url = self.client.url();
-        SurfnetRemoteClient::new_unsafe(remote_rpc_url)
-            .expect("unable to clone SurfnetRemoteClient")
+        match self.tls {
+            DatasourceTls::Verified => SurfnetRemoteClient::new(remote_rpc_url),
+            DatasourceTls::Insecure => SurfnetRemoteClient::new_insecure(remote_rpc_url)
+                .expect("unable to clone SurfnetRemoteClient"),
+        }
     }
 }
 
@@ -174,13 +193,31 @@ impl SurfnetRemoteClient {
     pub fn new<U: ToString>(remote_rpc_url: U) -> Self {
         SurfnetRemoteClient {
             client: SurfpoolRpcClient::new(remote_rpc_url).client,
+            tls: DatasourceTls::Verified,
         }
     }
 
-    pub fn new_unsafe<U: ToString>(remote_rpc_url: U) -> Option<Self> {
-        SurfpoolRpcClient::new_unsafe(remote_rpc_url).map(|rpc_client| SurfnetRemoteClient {
+    /// Accepts the datasource's certificate without verifying it. Call only
+    /// where the operator opted in; [`Self::for_datasource`] is that decision.
+    pub fn new_insecure<U: ToString>(remote_rpc_url: U) -> Option<Self> {
+        SurfpoolRpcClient::new_insecure(remote_rpc_url).map(|rpc_client| SurfnetRemoteClient {
             client: rpc_client.client,
+            tls: DatasourceTls::Insecure,
         })
+    }
+
+    /// The client a running surfnet reaches its datasource through.
+    ///
+    /// One place decides the posture, so the two runloop paths that build a
+    /// datasource client cannot drift apart on it.
+    pub fn for_datasource<U: ToString>(
+        remote_rpc_url: U,
+        allow_insecure_remote_tls: bool,
+    ) -> Option<Self> {
+        match allow_insecure_remote_tls {
+            false => Some(Self::new(remote_rpc_url)),
+            true => Self::new_insecure(remote_rpc_url),
+        }
     }
 
     pub async fn get_epoch_info(&self) -> SurfpoolResult<EpochInfo> {
@@ -655,5 +692,64 @@ mod tests {
             message.contains("GetSlot"),
             "the failure should identify the request: {message}"
         );
+    }
+
+    const DATASOURCE: &str = "https://api.mainnet-beta.solana.com";
+
+    /// The default datasource, the public mainnet endpoint included, is reached
+    /// over a connection whose certificate is checked. Accepting an unverified
+    /// certificate is a decision the operator makes, not the default.
+    #[test]
+    fn the_default_datasource_client_verifies_certificates() {
+        assert_eq!(
+            SurfnetRemoteClient::new(DATASOURCE).tls,
+            DatasourceTls::Verified
+        );
+        assert_eq!(
+            SurfnetRemoteClient::for_datasource(DATASOURCE, false)
+                .expect("the verified client is infallible")
+                .tls,
+            DatasourceTls::Verified
+        );
+    }
+
+    /// A datasource behind a self-signed cert stays reachable, by asking.
+    #[test]
+    fn accepting_an_invalid_certificate_remains_available_as_an_opt_in() {
+        assert_eq!(
+            SurfnetRemoteClient::for_datasource(DATASOURCE, true)
+                .expect("the opt-in client should build")
+                .tls,
+            DatasourceTls::Insecure
+        );
+    }
+
+    /// Every datasource read clones the client, so a clone that rebuilt itself
+    /// through the unverified constructor downgraded every request made after
+    /// the first regardless of what the operator asked for.
+    #[test]
+    fn a_clone_does_not_downgrade_a_verified_client() {
+        let client = SurfnetRemoteClient::new(DATASOURCE);
+
+        assert_eq!(client.clone().tls, DatasourceTls::Verified);
+        assert_eq!(client.clone().clone().tls, DatasourceTls::Verified);
+    }
+
+    /// The other direction of the same requirement: a clone preserves the
+    /// posture it was given, so opting in survives being cloned.
+    #[test]
+    fn a_clone_preserves_an_opted_in_insecure_client() {
+        let client = SurfnetRemoteClient::for_datasource(DATASOURCE, true)
+            .expect("the opt-in client should build");
+
+        assert_eq!(client.clone().tls, DatasourceTls::Insecure);
+    }
+
+    /// The URL survives the posture-preserving clone.
+    #[test]
+    fn a_clone_still_points_at_the_same_datasource() {
+        let client = SurfnetRemoteClient::new(DATASOURCE);
+
+        assert_eq!(client.clone().client.url(), client.client.url());
     }
 }

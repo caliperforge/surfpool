@@ -186,11 +186,12 @@ pub async fn start_local_surfnet_runloop(
 
     let remote_rpc_client = match simnet.offline_mode {
         true => None,
-        false => SurfnetRemoteClient::new_unsafe(
+        false => SurfnetRemoteClient::for_datasource(
             simnet
                 .remote_rpc_url
                 .as_ref()
                 .unwrap_or(&DEFAULT_MAINNET_RPC_URL.to_string()),
+            simnet.allow_insecure_remote_tls,
         ),
     };
 
@@ -372,6 +373,7 @@ pub async fn start_block_production_runloop(
         expiry_duration_ms.map(|expiry_val| Utc::now().timestamp_millis() as u64 + expiry_val);
     let global_skip_sig_verify = simnet_config.skip_signature_verification;
     let ix_profiling_initially_enabled = simnet_config.instruction_profiling_enabled;
+    let allow_insecure_remote_tls = simnet_config.allow_insecure_remote_tls;
     loop {
         let mut do_produce_block = false;
 
@@ -567,7 +569,10 @@ pub async fn start_block_production_runloop(
                     SimnetCommand::FetchRemoteAccounts(pubkeys, remote_url) => {
                         // The submitter already marked RemoteAccounts as started;
                         // StartStartupTask precedes this command on the same channel.
-                        let fetch_result = match SurfnetRemoteClient::new_unsafe(&remote_url) {
+                        let fetch_result = match SurfnetRemoteClient::for_datasource(
+                            &remote_url,
+                            allow_insecure_remote_tls,
+                        ) {
                             Some(remote_client) => match svm_locker
                                 .get_multiple_accounts_with_remote_fallback(
                                     &remote_client,

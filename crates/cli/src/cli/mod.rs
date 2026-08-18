@@ -284,6 +284,14 @@ pub struct StartNetworkOptions {
         long_help = "Run without a remote RPC datasource. Use this to simulate an offline environment.\n\nExample: surfpool start --offline"
     )]
     pub offline: bool,
+    /// Accept the datasource's TLS certificate without verifying it.
+    #[clap(
+        long = "allow-insecure-remote-tls",
+        action=ArgAction::SetTrue,
+        default_value = "false",
+        long_help = "Accept the datasource's TLS certificate without verifying it. Use this only for a datasource behind a self-signed cert.\n\nAnyone able to intercept the connection can then impersonate the datasource, and the accounts it serves are written into the local bank, executable program bytecode included.\n\nExample: surfpool start --rpc-url https://my-datasource.internal --allow-insecure-remote-tls"
+    )]
+    pub allow_insecure_remote_tls: bool,
 }
 
 #[derive(Args, PartialEq, Clone, Debug)]
@@ -672,6 +680,7 @@ impl StartSimnet {
 
         SimnetConfig {
             remote_rpc_url,
+            allow_insecure_remote_tls: self.network.allow_insecure_remote_tls,
             slot_time: self.svm.slot_time,
             block_production_mode: self.svm.block_production_mode.clone(),
             airdrop_addresses,

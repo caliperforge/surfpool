@@ -25,6 +25,8 @@ void surfpool({ surfnet: { offline: true } });
 void surfpool({ offline: true });
 // @ts-expect-error unknown RPC option.
 void surfpool({ maxConcurrencyy: 2 });
+// The self-signed-datasource TLS opt-in is reachable from a JS caller.
+void surfpool({ surfnet: { allowInsecureRemoteTls: true } });
 
 // Attach mode: requires an existing payer; no `surfnet` handle or config.
 void (async () => {

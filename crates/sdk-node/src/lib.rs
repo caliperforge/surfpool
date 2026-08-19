@@ -74,6 +74,9 @@ impl Surfnet {
         if let Some(url) = config.remote_rpc_url {
             builder = builder.remote_rpc_url(url);
         }
+        if let Some(allow) = config.allow_insecure_remote_tls {
+            builder = builder.allow_insecure_remote_tls(allow);
+        }
         if let Some(mode) = config.block_production_mode.as_deref() {
             let mode = mode.parse::<BlockProductionMode>().map_err(|e| {
                 Error::new(
@@ -504,6 +507,10 @@ impl Surfnet {
 pub struct SurfnetConfig {
     pub offline: Option<bool>,
     pub remote_rpc_url: Option<String>,
+    /// Accept the datasource's TLS certificate without verifying it, for a
+    /// datasource behind a self-signed cert. Default: `false`. Anyone able to
+    /// intercept the connection can then impersonate the datasource.
+    pub allow_insecure_remote_tls: Option<bool>,
     pub block_production_mode: Option<String>,
     pub slot_time_ms: Option<f64>,
     pub airdrop_sol: Option<f64>,

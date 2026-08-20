@@ -6,25 +6,24 @@ import type { OverrideInstance } from "./OverrideInstance.js";
 /**
  * A scenario containing a timeline of overrides
  */
-export type Scenario = {
-  /**
-   * Unique identifier for the scenario (UUID v4 format)
-   */
-  id: string;
-  /**
-   * Human-readable name
-   */
-  name: string;
-  /**
-   * Description of this scenario
-   */
-  description: string;
-  /**
-   * List of override instances in this scenario - MUST be an array, NOT a string
-   */
-  overrides: Array<OverrideInstance>;
-  /**
-   * Tags for categorization
-   */
-  tags: Array<string>;
-};
+export type Scenario = { 
+/**
+ * Unique identifier for the scenario (UUID v4 format)
+ */
+id: string, 
+/**
+ * Human-readable name
+ */
+name: string, 
+/**
+ * Description of this scenario
+ */
+description: string, 
+/**
+ * List of override instances in this scenario - MUST be an array, NOT a string
+ */
+overrides: Array<OverrideInstance>, 
+/**
+ * Tags for categorization
+ */
+tags: Array<string>, };

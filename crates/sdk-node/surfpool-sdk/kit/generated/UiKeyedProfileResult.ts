@@ -4,10 +4,4 @@
 import type { UiAccount } from "./UiAccount.js";
 import type { UiProfileResult } from "./UiProfileResult.js";
 
-export type UiKeyedProfileResult = {
-  slot: bigint;
-  key: string;
-  instructionProfiles?: Array<UiProfileResult>;
-  transactionProfile: UiProfileResult;
-  readonlyAccountStates: { [key in string]: UiAccount };
-};
+export type UiKeyedProfileResult = { slot: bigint, key: string, instructionProfiles?: Array<UiProfileResult>, transactionProfile: UiProfileResult, readonlyAccountStates: { [key in string]: UiAccount }, };

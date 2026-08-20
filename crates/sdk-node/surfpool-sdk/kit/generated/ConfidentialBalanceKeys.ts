@@ -9,15 +9,14 @@
  * Each key unlocks a different half of the balance, so they are independently
  * optional: a caller holding only one still gets the half it can read.
  */
-export type ConfidentialBalanceKeys = {
-  /**
-   * The owner's AES key (base58 or base64, 16 bytes). Decrypts the available
-   * balance.
-   */
-  aesKey?: string;
-  /**
-   * The owner's ElGamal *secret* key (base58 or base64, 32 bytes), not the
-   * public key stored on the account. Decrypts the pending balance.
-   */
-  elgamalSecretKey?: string;
-};
+export type ConfidentialBalanceKeys = { 
+/**
+ * The owner's AES key (base58 or base64, 16 bytes). Decrypts the available
+ * balance.
+ */
+aesKey?: string, 
+/**
+ * The owner's ElGamal *secret* key (base58 or base64, 32 bytes), not the
+ * public key stored on the account. Decrypts the pending balance.
+ */
+elgamalSecretKey?: string, };

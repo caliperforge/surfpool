@@ -5,5 +5,4 @@
 /**
  * Mirrors [`solana_account_decoder_client_types::UiAccountEncoding`].
  */
-export type UiAccountEncoding =
-  "binary" | "base58" | "base64" | "jsonParsed" | "base64+zstd";
+export type UiAccountEncoding = "binary" | "base58" | "base64" | "jsonParsed" | "base64+zstd";

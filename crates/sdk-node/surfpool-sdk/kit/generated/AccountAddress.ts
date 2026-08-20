@@ -7,5 +7,4 @@ import type { PdaSeed } from "./PdaSeed.js";
  * Defines how an account address should be determined
  *Defines how an account address should be determined
  */
-export type AccountAddress =
-  { pubkey: string } | { pda: { programId: string; seeds: Array<PdaSeed> } };
+export type AccountAddress = { "pubkey": string } | { "pda": { programId: string, seeds: Array<PdaSeed>, } };

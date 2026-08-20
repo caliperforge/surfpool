@@ -5,4 +5,4 @@
 /**
  * Mirrors [`solana_account_decoder_client_types::ParsedAccount`].
  */
-export type ParsedAccount = { program: string; parsed: unknown; space: bigint };
+export type ParsedAccount = { program: string, parsed: unknown, space: bigint, };

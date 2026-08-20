@@ -4,8 +4,4 @@
 import type { ExportSnapshotFilter } from "./ExportSnapshotFilter.js";
 import type { ExportSnapshotScope } from "./ExportSnapshotScope.js";
 
-export type ExportSnapshotConfig = {
-  includeParsedAccounts?: boolean;
-  filter?: ExportSnapshotFilter;
-  scope: ExportSnapshotScope;
-};
+export type ExportSnapshotConfig = { includeParsedAccounts?: boolean, filter?: ExportSnapshotFilter, scope: ExportSnapshotScope, };

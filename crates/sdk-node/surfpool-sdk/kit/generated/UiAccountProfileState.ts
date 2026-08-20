@@ -6,5 +6,4 @@ import type { UiAccountChange } from "./UiAccountChange.js";
 /**
  * Mirrors [`crate::types::UiAccountProfileState`], with [`UiAccountChangeDef`] payloads.
  */
-export type UiAccountProfileState =
-  { type: "readonly" } | { type: "writable"; accountChange: UiAccountChange };
+export type UiAccountProfileState = { "type": "readonly" } | { "type": "writable", "accountChange": UiAccountChange };

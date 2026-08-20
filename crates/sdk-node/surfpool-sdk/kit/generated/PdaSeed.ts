@@ -6,13 +6,4 @@
  * Seeds used for PDA derivation
  *Seeds used for PDA derivation
  */
-export type PdaSeed =
-  | { pubkey: string }
-  | { string: string }
-  | { bytes: Array<number> }
-  | { propertyRef: string }
-  | { u16Be: number }
-  | { u16BeRef: string }
-  | { u16Le: number }
-  | { bytes32Ref: string }
-  | { derivedPda: { programId: string; seeds: Array<PdaSeed> } };
+export type PdaSeed = { "pubkey": string } | { "string": string } | { "bytes": Array<number> } | { "propertyRef": string } | { "u16Be": number } | { "u16BeRef": string } | { "u16Le": number } | { "bytes32Ref": string } | { "derivedPda": { programId: string, seeds: Array<PdaSeed>, } };

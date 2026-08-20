@@ -7,5 +7,4 @@ import type { UiAccountEncoding } from "./UiAccountEncoding.js";
 /**
  * Mirrors [`solana_account_decoder_client_types::UiAccountData`].
  */
-export type UiAccountData =
-  string | ParsedAccount | [string, UiAccountEncoding];
+export type UiAccountData = string | ParsedAccount | [string, UiAccountEncoding];

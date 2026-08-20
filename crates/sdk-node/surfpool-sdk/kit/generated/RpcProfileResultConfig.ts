@@ -4,7 +4,4 @@
 import type { RpcProfileDepth } from "./RpcProfileDepth.js";
 import type { UiAccountEncoding } from "./UiAccountEncoding.js";
 
-export type RpcProfileResultConfig = {
-  encoding?: UiAccountEncoding;
-  depth?: RpcProfileDepth;
-};
+export type RpcProfileResultConfig = { encoding?: UiAccountEncoding, depth?: RpcProfileDepth, };

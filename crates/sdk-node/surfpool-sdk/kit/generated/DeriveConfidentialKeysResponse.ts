@@ -7,18 +7,17 @@
  * `surfnet_deriveConfidentialKeys`. All three are base58-encoded and feed
  * directly into the other confidential cheatcodes.
  */
-export type DeriveConfidentialKeysResponse = {
-  /**
-   * The ElGamal public key: `surfnet_setTokenAccount`'s `elgamalPubkey`.
-   */
-  elgamalPubkey: string;
-  /**
-   * The ElGamal secret key: `surfnet_getConfidentialBalance`'s
-   * `elgamalSecretKey`.
-   */
-  elgamalSecretKey: string;
-  /**
-   * The AES key: the `aesKey` of both of the above.
-   */
-  aesKey: string;
-};
+export type DeriveConfidentialKeysResponse = { 
+/**
+ * The ElGamal public key: `surfnet_setTokenAccount`'s `elgamalPubkey`.
+ */
+elgamalPubkey: string, 
+/**
+ * The ElGamal secret key: `surfnet_getConfidentialBalance`'s
+ * `elgamalSecretKey`.
+ */
+elgamalSecretKey: string, 
+/**
+ * The AES key: the `aesKey` of both of the above.
+ */
+aesKey: string, };

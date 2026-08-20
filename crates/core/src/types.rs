@@ -1436,18 +1436,12 @@ fn decrypt_pending_balance(
 
 /// Derive an owner's confidential-transfer keys from the owner's signatures.
 ///
-/// Backs the `surfnet_deriveConfidentialKeys` cheatcode. Doing this server-side is
-/// what lets the confidential cheatcodes be used with no client-side crypto
-/// dependency at all: the caller signs the two seed messages its confidential
-/// client would sign, hands over the signatures, and gets back keys ready to pass
-/// to `surfnet_setTokenAccount` and `surfnet_getConfidentialBalance`.
+/// Backs the `surfnet_deriveConfidentialKeys` cheatcode: the caller signs the two seed
+/// messages and gets back keys ready to pass to the other confidential cheatcodes.
 ///
-/// The derivation semantics are documented once, on the RPC method that exposes this:
-/// see `surfnet_deriveConfidentialKeys` on
-/// [`crate::rpc::surfnet_cheatcodes::SurfnetCheatcodes`] for why the two seed messages are
-/// domain-separated and take one signature each, why the result is byte-identical to
-/// `ElGamalKeypair::new_from_signer` / `AeKey::new_from_signer`, and what does and does not
-/// cross the wire.
+/// The derivation semantics — domain separation, the `new_from_signer` equivalence, and
+/// what does and does not cross the wire — are documented on `surfnet_deriveConfidentialKeys`
+/// in [`crate::rpc::surfnet_cheatcodes::SurfnetCheatcodes`].
 ///
 /// `derive_confidential_keys` itself imposes no seed: the caller owns what the keys are
 /// scoped to, because the caller owns what it signed.

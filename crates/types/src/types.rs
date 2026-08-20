@@ -1255,16 +1255,13 @@ pub struct ConfidentialBalanceKeys {
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 pub struct GetConfidentialBalanceResponse {
     /// The available (spendable) balance, or `null` if no `aesKey` was supplied.
-    #[cfg_attr(feature = "ts-bindings", ts(type = "number | bigint | null"))]
     pub available: Option<u64>,
     /// The pending (credited but not yet applied) balance, or `null` if no
     /// `elgamalSecretKey` was supplied.
-    #[cfg_attr(feature = "ts-bindings", ts(type = "number | bigint | null"))]
     pub pending: Option<u64>,
     /// How many confidential credits are sitting in the pending balance. Non-zero
     /// means an `ApplyPendingBalance` is required before they show up in
     /// `available`.
-    #[cfg_attr(feature = "ts-bindings", ts(type = "number | bigint"))]
     pub pending_balance_credit_counter: u64,
 }
 

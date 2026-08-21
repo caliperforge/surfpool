@@ -161,6 +161,9 @@ pub fn scaffold_in_memory_iac(
                     artifacts_path,
                 ),
             );
+            deployment_runbook_src.push_str(&get_interpolated_program_output_template(
+                &program_metadata.name,
+            ));
         } else {
             debug!(
                 "Skipping program {} deployment in in-memory IaC since the .so file was not found",
@@ -198,6 +201,57 @@ pub fn scaffold_in_memory_iac(
     );
 
     Ok((runbook_id.into(), runbook_sources, manifest))
+}
+
+fn get_interpolated_program_output_template(program_name: &str) -> String {
+    format!(
+        r#"
+output "{program_name}_program_id" {{
+    description = "The program ID of the deployed {program_name} program"
+    value = action.deploy_{program_name}.program_id
+}}
+"#
+    )
+}
+
+#[allow(clippy::items_after_test_module)]
+#[cfg(test)]
+mod program_output_template_tests {
+    use super::*;
+
+    #[test]
+    fn interpolated_program_output_for_one_program() {
+        let expected = r#"
+output "hello_world_program_id" {
+    description = "The program ID of the deployed hello_world program"
+    value = action.deploy_hello_world.program_id
+}
+"#;
+        assert_eq!(
+            get_interpolated_program_output_template("hello_world").trim(),
+            expected.trim()
+        );
+    }
+
+    #[test]
+    fn interpolated_program_output_for_several_programs() {
+        let mut src = String::new();
+        for name in ["counter", "vault"] {
+            src.push_str(&get_interpolated_program_output_template(name));
+        }
+        let expected = r#"
+output "counter_program_id" {
+    description = "The program ID of the deployed counter program"
+    value = action.deploy_counter.program_id
+}
+
+output "vault_program_id" {
+    description = "The program ID of the deployed vault program"
+    value = action.deploy_vault.program_id
+}
+"#;
+        assert_eq!(src.trim(), expected.trim());
+    }
 }
 
 pub fn scaffold_iac_layout(
@@ -300,6 +354,9 @@ pub fn scaffold_iac_layout(
         deployment_runbook_src.push_str(
             &framework.get_interpolated_program_deployment_template(&program_metadata.name),
         );
+        deployment_runbook_src.push_str(&get_interpolated_program_output_template(
+            &program_metadata.name,
+        ));
     }
 
     let runbook_name = "deployment";

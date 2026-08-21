@@ -214,46 +214,6 @@ output "{program_name}_program_id" {{
     )
 }
 
-#[allow(clippy::items_after_test_module)]
-#[cfg(test)]
-mod program_output_template_tests {
-    use super::*;
-
-    #[test]
-    fn interpolated_program_output_for_one_program() {
-        let expected = r#"
-output "hello_world_program_id" {
-    description = "The program ID of the deployed hello_world program"
-    value = action.deploy_hello_world.program_id
-}
-"#;
-        assert_eq!(
-            get_interpolated_program_output_template("hello_world").trim(),
-            expected.trim()
-        );
-    }
-
-    #[test]
-    fn interpolated_program_output_for_several_programs() {
-        let mut src = String::new();
-        for name in ["counter", "vault"] {
-            src.push_str(&get_interpolated_program_output_template(name));
-        }
-        let expected = r#"
-output "counter_program_id" {
-    description = "The program ID of the deployed counter program"
-    value = action.deploy_counter.program_id
-}
-
-output "vault_program_id" {
-    description = "The program ID of the deployed vault program"
-    value = action.deploy_vault.program_id
-}
-"#;
-        assert_eq!(src.trim(), expected.trim());
-    }
-}
-
 pub fn scaffold_iac_layout(
     framework: &Framework,
     programs: &[ProgramMetadata],
@@ -570,4 +530,29 @@ pub fn scaffold_iac_layout(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod program_output_template_tests {
+    use super::*;
+
+    #[test]
+    fn every_program_gets_its_own_output_block_separated_by_a_blank_line() {
+        let mut src = String::new();
+        for name in ["counter", "vault"] {
+            src.push_str(&get_interpolated_program_output_template(name));
+        }
+        let expected = r#"
+output "counter_program_id" {
+    description = "The program ID of the deployed counter program"
+    value = action.deploy_counter.program_id
+}
+
+output "vault_program_id" {
+    description = "The program ID of the deployed vault program"
+    value = action.deploy_vault.program_id
+}
+"#;
+        assert_eq!(src.trim(), expected.trim());
+    }
 }

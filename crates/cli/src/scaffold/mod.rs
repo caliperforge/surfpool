@@ -481,9 +481,6 @@ pub fn scaffold_iac_layout(
             //     "file {} already exists. choose a different runbook name, or rename the existing file",
             //     runbook_file_location.to_string()
             // ))
-            // The scaffold succeeded — `txtx.yml` and the runbooks tree are on
-            // disk — so the install belongs here too. No later start re-enters.
-            spawn_dev_skill_install(dev_skill_install_command(base_location));
             return Ok(());
         }
         false => {

@@ -180,6 +180,13 @@ fn spawn_dev_skill_install(mut command: Command) {
     });
 }
 
+/// The install that follows the confirmation, or nothing. A declined
+/// confirmation cancels the deployment, and the install is part of what it
+/// cancels.
+fn install_after_confirmation(confirmation: bool, base_location: &FileLocation) -> Option<Command> {
+    confirmation.then(|| dev_skill_install_command(base_location))
+}
+
 pub fn scaffold_in_memory_iac(
     framework: &Framework,
     programs: &[ProgramMetadata],
@@ -561,13 +568,10 @@ pub fn scaffold_iac_layout(
         println!("Deployment canceled");
     }
 
-    // Last, so the install only ever follows a scaffold that finished. Every
-    // exit above this line is an `Err` from a `?`, prompt cancellations
-    // included, and leaves no install running behind it. The one exception is
-    // the early `Ok(())` when `main.tx` already exists, which is a finished
-    // scaffold and starts its own. `txtx.yml` is written well above here, so
-    // the next start is no longer a scaffold and neither call site can fire twice.
-    spawn_dev_skill_install(dev_skill_install_command(base_location));
+    // Last, so the install only follows a scaffold that finished.
+    if let Some(command) = install_after_confirmation(confirmation, base_location) {
+        spawn_dev_skill_install(command);
+    }
 
     Ok(())
 }
@@ -582,7 +586,7 @@ mod tests {
 
     use super::{
         DEV_SKILL_INSTALLER, DEV_SKILL_REPO, FileLocation, dev_skill_install_command,
-        spawn_dev_skill_install,
+        install_after_confirmation, spawn_dev_skill_install,
     };
 
     #[cfg(unix)]
@@ -636,6 +640,15 @@ mod tests {
             dev_skill_install_command(&base).get_current_dir(),
             Some(Path::new("/tmp/surfpool-567-scaffold"))
         );
+    }
+
+    /// Declining the confirmation cancels the deployment, and the install is
+    /// part of what it cancels. Nothing is built, so nothing is spawned.
+    #[test]
+    fn a_declined_confirmation_starts_no_install() {
+        let base = FileLocation::from_path_string("/tmp/surfpool-567-scaffold").unwrap();
+        assert!(install_after_confirmation(false, &base).is_none());
+        assert!(install_after_confirmation(true, &base).is_some());
     }
 
     /// The three ways this goes wrong on a real machine: no Node at all, an

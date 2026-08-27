@@ -1339,29 +1339,13 @@ pub trait SurfnetCheatcodes {
     /// ```
     ///
     /// # Notes
-    /// The keys come from `ElGamalKeypair::new_from_signature` and `AeKey::new_from_signature` in the
-    /// `solana_zk_sdk` this build pins. Those are the same two functions `new_from_signer` calls once
-    /// it has signed the seed messages itself, so signing `"ElGamalSecretKey" || token_account` and
-    /// `"AeKey" || token_account` here yields byte-identical keys to
-    /// `ElGamalKeypair::new_from_signer(&owner, token_account.as_ref())` and
-    /// `AeKey::new_from_signer(&owner, token_account.as_ref())`. An account configured off-chain by a
-    /// client on that derivation opens with these keys. The one input where the two paths would
-    /// otherwise part is the all-zero default signature, which `new_from_signer` refuses as key
-    /// material and `new_from_signature` would hash into a publicly computable key pair; this
-    /// method rejects it too, so the equivalence holds without exception.
-    ///
-    /// That SDK marks the KDF behind these functions as non-standard and intends to replace it, so
-    /// what these keys interoperate with is the SDK version, not a frozen standard.
-    ///
     /// The owner's *signing* key never crosses the wire: the caller signs the two seed messages
     /// locally and sends only the signatures, so a hardware signer, which never exposes its signing
     /// key, can drive this. The signatures are used only as key material and are not stored.
     ///
     /// What that does and does not buy is worth stating plainly. Because the ElGamal secret is a
     /// hash of the signature, `elgamalSignature` is exactly as sensitive as the `elgamalSecretKey`
-    /// it derives: anyone who sees it recomputes that key offline. What changed is that the
-    /// material on the wire no longer confers transaction-signing power, only confidential-balance
-    /// decryption; it is not that nothing sensitive is transported.
+    /// it derives: anyone who sees it recomputes that key offline.
     ///
     /// The derived `elgamalSecretKey` and `aesKey` do travel back in the response, and
     /// `surfnet_getConfidentialBalance` takes them back as inputs. That is the point of the
@@ -2432,7 +2416,6 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             } = svm_locker
                 .get_account(&remote_ctx, &token_account, None)
                 .await?;
-            svm_locker.write_account_update(account_result.clone());
 
             let account = account_result.map_account()?;
             if account.owner != spl_token_2022_interface::id() {

@@ -12,7 +12,7 @@ use solana_client::{
         RpcSignaturesForAddressConfig, RpcTokenAccountsFilter, RpcTransactionConfig,
     },
     rpc_filter::RpcFilterType,
-    rpc_request::{RpcRequest, TokenAccountsFilter},
+    rpc_request::{RpcError, RpcRequest, TokenAccountsFilter},
     rpc_response::{
         RpcAccountBalance, RpcConfirmedTransactionStatusWithSignature, RpcKeyedAccount, RpcResult,
         RpcTokenAccountBalance,
@@ -29,16 +29,20 @@ use solana_rpc_client::{
     http_sender::HttpSender,
     rpc_sender::{RpcSender, RpcTransportStats},
 };
-use solana_rpc_client_api::client_error::{ErrorKind as ClientErrorKind, Result as ClientResult};
+use solana_rpc_client_api::client_error::{
+    Error as ClientError, ErrorKind as ClientErrorKind, Result as ClientResult,
+};
 use solana_signature::Signature;
-use solana_transaction_status::UiConfirmedBlock;
+use solana_transaction_status::{EncodedConfirmedTransactionWithStatusMeta, UiConfirmedBlock};
 use surfpool_types::sanitized_datasource_url;
 
 use super::GetTransactionResult;
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
     rpc::utils::is_method_not_supported_error,
-    surfnet::{GetAccountResult, locker::is_supported_token_program},
+    surfnet::{
+        AccountSource, CoupledAccount, GetAccountResult, locker::is_supported_token_program,
+    },
     types::{RemoteRpcResult, TokenAccount},
 };
 
@@ -51,6 +55,50 @@ use crate::{
 /// sits comfortably above that 30 second per-attempt timeout, since a deadline
 /// at or below it would cut off attempts that were going to succeed.
 const DATASOURCE_DEADLINE: Duration = Duration::from_secs(60);
+
+fn sanitized_client_error(error: &ClientError, datasource_url: &str) -> String {
+    let endpoint =
+        sanitized_datasource_url(datasource_url).unwrap_or_else(|| "the datasource".to_string());
+
+    match error.kind() {
+        ClientErrorKind::Reqwest(error) => {
+            if let Some(status) = error.status() {
+                format!("datasource returned HTTP {status} from {endpoint}")
+            } else if error.is_timeout() {
+                format!("datasource request to {endpoint} timed out")
+            } else if error.is_connect() {
+                format!("failed to connect to {endpoint}")
+            } else if error.is_decode() {
+                format!("failed to decode the response from {endpoint}")
+            } else {
+                format!("datasource request to {endpoint} failed")
+            }
+        }
+        ClientErrorKind::Middleware(_) => format!("datasource middleware failed for {endpoint}"),
+        ClientErrorKind::Io(error) => {
+            format!("datasource I/O error ({:?}) for {endpoint}", error.kind())
+        }
+        ClientErrorKind::SerdeJson(error) => format!(
+            "invalid JSON response from {endpoint} at line {}, column {}",
+            error.line(),
+            error.column()
+        ),
+        ClientErrorKind::RpcError(error) => match error {
+            RpcError::RpcRequestError(_) | RpcError::ForUser(_) => {
+                format!("datasource RPC request failed for {endpoint}")
+            }
+            RpcError::RpcResponseError { code, .. } => {
+                format!("datasource RPC response error {code} from {endpoint}")
+            }
+            RpcError::ParseError(_) => {
+                format!("failed to parse the RPC response from {endpoint}")
+            }
+        },
+        ClientErrorKind::SigningError(error) => error.to_string(),
+        ClientErrorKind::TransactionError(error) => error.to_string(),
+        ClientErrorKind::Custom(_) => format!("datasource client error for {endpoint}"),
+    }
+}
 
 /// Bounds how long the sender it wraps may take, so a datasource that stops
 /// answering surfaces as an error rather than as a surfnet that appears stuck.
@@ -216,9 +264,10 @@ impl SurfnetRemoteClient {
                             .await
                             .map_err(|e| SurfpoolError::get_account(*pubkey, e))?;
 
-                        result = Some(GetAccountResult::FoundTokenAccount(
+                        result = Some(GetAccountResult::FoundCoupledAccount(
                             (*pubkey, account.clone()),
-                            (token_account.mint(), mint.value),
+                            CoupledAccount::Mint(token_account.mint(), mint.value),
+                            AccountSource::Remote,
                         ));
                     };
                 } else if account.executable {
@@ -230,16 +279,17 @@ impl SurfnetRemoteClient {
                         .await
                         .map_err(|e| SurfpoolError::get_account(*pubkey, e))?;
 
-                    result = Some(GetAccountResult::FoundProgramAccount(
+                    result = Some(GetAccountResult::FoundCoupledAccount(
                         (*pubkey, account.clone()),
-                        (program_data_address, program_data.value),
+                        CoupledAccount::ProgramData(program_data_address, program_data.value),
+                        AccountSource::Remote,
                     ));
                 }
 
                 result.unwrap_or(GetAccountResult::FoundAccount(
-                    *pubkey, account,
-                    // Mark this account as needing to be updated in the SVM, since we fetched it
-                    true,
+                    *pubkey,
+                    account,
+                    AccountSource::Remote,
                 ))
             }
             None => GetAccountResult::None(*pubkey),
@@ -291,8 +341,7 @@ impl SurfnetRemoteClient {
                             GetAccountResult::FoundAccount(
                                 *pubkey,
                                 remote_account,
-                                // Mark this account as needing to be updated in the SVM, since we fetched it
-                                true,
+                                AccountSource::Remote,
                             ),
                         );
                     }
@@ -305,8 +354,7 @@ impl SurfnetRemoteClient {
                         GetAccountResult::FoundAccount(
                             *pubkey,
                             remote_account,
-                            // Mark this account as needing to be updated in the SVM, since we fetched it
-                            true,
+                            AccountSource::Remote,
                         ),
                     );
                 }
@@ -357,17 +405,22 @@ impl SurfnetRemoteClient {
                     // mint accounts to be inserted
                     results_map.insert(
                         account_buffer[index].0,
-                        GetAccountResult::FoundTokenAccount(
+                        GetAccountResult::FoundCoupledAccount(
                             (account_buffer[index].0, account_buffer[index].1.clone()),
-                            (account_buffer[index].2, remote_account.clone()),
+                            CoupledAccount::Mint(account_buffer[index].2, remote_account.clone()),
+                            AccountSource::Remote,
                         ),
                     );
                 } else {
                     results_map.insert(
                         account_buffer[index].0,
-                        GetAccountResult::FoundProgramAccount(
+                        GetAccountResult::FoundCoupledAccount(
                             (account_buffer[index].0, account_buffer[index].1.clone()),
-                            (account_buffer[index].2, remote_account.clone()),
+                            CoupledAccount::ProgramData(
+                                account_buffer[index].2,
+                                remote_account.clone(),
+                            ),
+                            AccountSource::Remote,
                         ),
                     );
                 }
@@ -394,13 +447,43 @@ impl SurfnetRemoteClient {
         latest_absolute_slot: u64,
     ) -> GetTransactionResult {
         match self
-            .client
-            .get_transaction_with_config(&signature, config)
+            .try_get_transaction(signature, config, latest_absolute_slot)
             .await
         {
-            Ok(tx) => GetTransactionResult::found_transaction(signature, tx, latest_absolute_slot),
-            Err(_) => GetTransactionResult::None(signature),
+            Ok(result) => result,
+            Err(e) => {
+                error!("{e}");
+                GetTransactionResult::None(signature)
+            }
         }
+    }
+
+    pub(crate) async fn try_get_transaction(
+        &self,
+        signature: Signature,
+        config: RpcTransactionConfig,
+        latest_absolute_slot: u64,
+    ) -> SurfpoolResult<GetTransactionResult> {
+        let transaction = self
+            .client
+            .send::<Option<EncodedConfirmedTransactionWithStatusMeta>>(
+                RpcRequest::GetTransaction,
+                json!([signature.to_string(), config]),
+            )
+            .await
+            .map_err(|error| {
+                SurfpoolError::get_transaction(
+                    signature,
+                    sanitized_client_error(&error, &self.client.url()),
+                )
+            })?;
+
+        Ok(match transaction {
+            Some(tx) => {
+                GetTransactionResult::found_transaction(signature, tx, latest_absolute_slot)
+            }
+            None => GetTransactionResult::None(signature),
+        })
     }
 
     pub async fn get_token_accounts_by_owner(
@@ -571,7 +654,207 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use solana_client::rpc_request::RpcResponseErrorData;
+
     use super::*;
+    use crate::surfnet::{locker::SurfnetSvmLocker, svm::SurfnetSvm};
+
+    struct ReturnsNull {
+        requests: Arc<Mutex<Vec<(RpcRequest, serde_json::Value)>>>,
+    }
+
+    #[async_trait]
+    impl RpcSender for ReturnsNull {
+        async fn send(
+            &self,
+            request: RpcRequest,
+            params: serde_json::Value,
+        ) -> ClientResult<serde_json::Value> {
+            self.requests
+                .lock()
+                .expect("request recorder mutex should not be poisoned")
+                .push((request, params));
+            Ok(serde_json::Value::Null)
+        }
+
+        fn get_transport_stats(&self) -> RpcTransportStats {
+            RpcTransportStats::default()
+        }
+
+        fn url(&self) -> String {
+            "http://returns-null.example".to_string()
+        }
+    }
+
+    struct ReturnsError;
+
+    #[async_trait]
+    impl RpcSender for ReturnsError {
+        async fn send(
+            &self,
+            _request: RpcRequest,
+            _params: serde_json::Value,
+        ) -> ClientResult<serde_json::Value> {
+            Err(ClientErrorKind::Custom("provider unavailable".to_string()).into())
+        }
+
+        fn get_transport_stats(&self) -> RpcTransportStats {
+            RpcTransportStats::default()
+        }
+
+        fn url(&self) -> String {
+            "http://returns-error.example".to_string()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_missing_remote_transaction_remains_none_through_the_locker() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let client = SurfnetRemoteClient {
+            client: RpcClient::new_sender(
+                ReturnsNull {
+                    requests: Arc::clone(&requests),
+                },
+                RpcClientConfig::default(),
+            ),
+        };
+        let signature = Signature::new_unique();
+        let config = RpcTransactionConfig {
+            encoding: Some(solana_transaction_status::UiTransactionEncoding::Base64),
+            commitment: Some(CommitmentConfig::confirmed()),
+            max_supported_transaction_version: Some(0),
+        };
+        let (svm, _, _) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+
+        let result = locker
+            .get_transaction(&Some(client), &signature, config)
+            .await
+            .expect("a null getTransaction result is not a provider failure");
+
+        assert!(matches!(result, GetTransactionResult::None(found) if found == signature));
+        let requests = requests
+            .lock()
+            .expect("request recorder mutex should not be poisoned");
+        assert_eq!(
+            requests.as_slice(),
+            &[(
+                RpcRequest::GetTransaction,
+                json!([signature.to_string(), config])
+            )]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_remote_transaction_provider_failure_reaches_the_locker_caller() {
+        let client = SurfnetRemoteClient {
+            client: RpcClient::new_sender(ReturnsError, RpcClientConfig::default()),
+        };
+        let signature = Signature::new_unique();
+        let (svm, _, _) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+
+        let error = match locker
+            .get_transaction(&Some(client), &signature, RpcTransactionConfig::default())
+            .await
+        {
+            Ok(_) => panic!("a provider failure must not be reported as a missing transaction"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+
+        assert!(message.contains(&signature.to_string()));
+        assert!(message.contains("datasource client error"));
+        assert!(message.contains("http://returns-error.example"));
+        assert!(!message.contains("provider unavailable"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_remote_transaction_failure_does_not_disclose_datasource_credentials() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let address = listener
+            .local_addr()
+            .expect("test server should have a local address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("test server should accept");
+            let mut request = [0u8; 4096];
+            stream
+                .readable()
+                .await
+                .expect("request stream should become readable");
+            stream
+                .try_read(&mut request)
+                .expect("test server should read the request");
+            let response = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n";
+            stream
+                .writable()
+                .await
+                .expect("response stream should become writable");
+            stream
+                .try_write(response)
+                .expect("test server should write the response");
+        });
+        let datasource =
+            format!("http://user:SUPERSECRET@{address}/private-path?api-key=SUPERSECRET");
+        let client = SurfnetRemoteClient::new(&datasource);
+        let signature = Signature::new_unique();
+
+        let error = match client
+            .try_get_transaction(signature, RpcTransactionConfig::default(), 0)
+            .await
+        {
+            Ok(_) => panic!("an HTTP failure should reach the caller"),
+            Err(error) => error.to_string(),
+        };
+        server.await.expect("test server should finish");
+
+        assert!(error.contains("401 Unauthorized"));
+        assert!(error.contains("http://127.0.0.1"));
+        assert!(!error.contains("SUPERSECRET"));
+        assert!(!error.contains("private-path"));
+        assert!(!error.contains("api-key"));
+    }
+
+    #[test]
+    fn provider_reflections_do_not_disclose_datasource_credentials() {
+        let datasource =
+            "https://user:SUPERSECRET@rpc.example.com/private/SUPERSECRET?api-key=SUPERSECRET";
+
+        for fragment in [
+            "user:SUPERSECRET",
+            "/private/SUPERSECRET",
+            "api-key=SUPERSECRET",
+        ] {
+            let errors = [
+                (
+                    ClientErrorKind::RpcError(RpcError::RpcResponseError {
+                        code: -32000,
+                        message: fragment.to_string(),
+                        data: RpcResponseErrorData::Empty,
+                    }),
+                    Some("-32000"),
+                ),
+                (ClientErrorKind::Custom(fragment.to_string()), None),
+            ];
+
+            for (error, expected_code) in errors {
+                let error = ClientError::from(error);
+                let message = sanitized_client_error(&error, datasource);
+
+                assert!(!message.contains("SUPERSECRET"));
+                assert!(!message.contains("private"));
+                assert!(!message.contains("api-key"));
+                assert!(message.contains("https://rpc.example.com"));
+                if let Some(code) = expected_code {
+                    assert!(message.contains(code));
+                }
+            }
+        }
+    }
 
     /// A call that never completes, whether because the endpoint went quiet
     /// or because its retry policy never gave control back. The deadline does

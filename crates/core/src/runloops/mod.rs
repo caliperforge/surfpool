@@ -45,7 +45,7 @@ use crate::{
         surfnet_cheatcodes::SurfnetCheatcodes, ws::Rpc,
     },
     surfnet::{
-        GetAccountResult, GeyserEvent, PluginCommand, locker::SurfnetSvmLocker,
+        AccountSource, GetAccountResult, GeyserEvent, PluginCommand, locker::SurfnetSvmLocker,
         remote::SurfnetRemoteClient,
     },
 };
@@ -577,11 +577,6 @@ pub async fn start_block_production_runloop(
                                 .await
                             {
                                 Ok(account_updates) => {
-                                    // The locker holds one write guard while applying the complete
-                                    // batch, so Ready cannot expose a partially installed clone set.
-                                    svm_locker
-                                        .write_multiple_account_updates(&account_updates.inner);
-
                                     // A cloned account the datasource does not have is not a
                                     // failure: hydration did complete, and some workflows clone
                                     // addresses that do not exist yet. Warn, though, because the
@@ -1171,7 +1166,7 @@ mod absent_after_hydration_tests {
         let results = vec![
             GetAccountResult::None(missing),
             GetAccountResult::None(offline),
-            GetAccountResult::FoundAccount(found, Account::default(), true),
+            GetAccountResult::FoundAccount(found, Account::default(), AccountSource::Generated),
         ];
 
         assert_eq!(

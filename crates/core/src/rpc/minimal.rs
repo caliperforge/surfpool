@@ -626,12 +626,9 @@ impl Minimal for SurfpoolMinimalRpc {
 
             let balance = match &account_update {
                 GetAccountResult::FoundAccount(_, account, _)
-                | GetAccountResult::FoundProgramAccount((_, account), _)
-                | GetAccountResult::FoundTokenAccount((_, account), _) => account.lamports,
+                | GetAccountResult::FoundCoupledAccount((_, account), _, _) => account.lamports,
                 GetAccountResult::None(_) => 0,
             };
-
-            svm_locker.write_account_update(account_update);
 
             #[cfg(feature = "prometheus")]
             if let Some(m) = crate::telemetry::metrics() {
@@ -1119,8 +1116,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_get_genesis_hash() {
+    async fn test_get_genesis_hash_returns_configured_genesis_hash() {
         let setup = TestSetup::new(SurfpoolMinimalRpc);
+        let genesis_config = GenesisConfig::default();
+        let expected_genesis_hash = genesis_config.hash().to_string();
+
+        setup.context.svm_locker.with_svm_writer(|svm_writer| {
+            svm_writer.genesis_config = genesis_config;
+        });
 
         let genesis_hash = setup
             .rpc
@@ -1128,7 +1131,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(genesis_hash, GenesisConfig::default().hash().to_string())
+        assert_eq!(genesis_hash, expected_genesis_hash)
     }
 
     #[test]

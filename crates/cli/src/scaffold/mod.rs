@@ -154,6 +154,7 @@ const DEV_SKILL_DIR: &str = ".agents/skills/solana-dev";
 
 const DEV_SKILL_DECLINED_MARKER: &str = ".config/surfpool/dev-skill-declined";
 
+/// Two `-y`, two programs: npx's auto-installs the package, the skills CLI's skips its prompts.
 fn dev_skill_install_command(base_location: &FileLocation) -> Command {
     let mut command = Command::new("npx");
     command.args([

@@ -141,10 +141,7 @@ impl ProgramMetadata {
 
 const DEV_SKILL_REPO: &str = "https://github.com/solana-foundation/solana-dev-skill";
 
-/// Pinned: an unversioned `npx skills` runs whatever the registry calls latest
-/// at the moment of someone's first scaffold, which is not a thing this can
-/// promise anyone. An exact version is the only form that resolves the same way
-/// twice; a range still floats to the newest release inside it.
+/// Exact, not a range: anything looser installs whatever the registry calls latest that day.
 const DEV_SKILL_INSTALLER: &str = "skills@1.5.23";
 
 /// Named because the installer, detecting none of its own agents, otherwise fans the
@@ -153,16 +150,10 @@ const DEV_SKILL_INSTALLER: &str = "skills@1.5.23";
 /// its own registry key for the canonical `.agents/skills` copy and symlinks nowhere.
 const DEV_SKILL_AGENT: &str = "universal";
 
-/// Where `universal` puts the skill, under the project or under a home that took it
-/// globally.
 const DEV_SKILL_DIR: &str = ".agents/skills/solana-dev";
 
-/// A remembered "no". Its existence is the whole answer, so deleting it asks again.
 const DEV_SKILL_DECLINED_MARKER: &str = ".config/surfpool/dev-skill-declined";
 
-/// Builds the skill install as issue #567 specifies it, pinned, restricted to the one
-/// agent whose layout the prompt names, and rooted at the project being scaffolded
-/// rather than wherever the process happens to sit.
 fn dev_skill_install_command(base_location: &FileLocation) -> Command {
     let mut command = Command::new("npx");
     command.args([
@@ -180,11 +171,8 @@ fn dev_skill_install_command(base_location: &FileLocation) -> Command {
     command
 }
 
-/// Starts the skill install and returns, whatever becomes of it.
-///
-/// This runs on the way to booting someone's surfnet, so it gets no say in
-/// that: never waited on, output never reaching the terminal, and nothing at
-/// all on a machine without Node — the usual case for a Rust user.
+/// Fire-and-forget: this sits on the path to booting a surfnet, so a missing Node or a failed
+/// install is silence rather than an error, and the wait that reaps the child runs off-thread.
 fn spawn_dev_skill_install(mut command: Command) {
     let Ok(mut child) = command
         .stdin(Stdio::null())
@@ -194,14 +182,11 @@ fn spawn_dev_skill_install(mut command: Command) {
     else {
         return;
     };
-    // Reaped off-thread: the child leaves no defunct entry, the scaffold no wait.
     let _ = hiro_system_kit::thread_named("Dev Skill Install").spawn(move || {
         let _ = child.wait();
     });
 }
 
-/// Both scopes the install can already have happened in: this project, or a home
-/// that took the skill globally.
 fn dev_skill_installed(base: &Path, home: &Path) -> bool {
     base.join(DEV_SKILL_DIR).exists() || home.join(DEV_SKILL_DIR).exists()
 }
@@ -210,8 +195,6 @@ fn dev_skill_declined(home: &Path) -> bool {
     home.join(DEV_SKILL_DECLINED_MARKER).exists()
 }
 
-/// `None` when the prompt could not be put on screen at all, which is not an answer
-/// and so is not remembered.
 fn prompt_for_dev_skill(theme: &ColorfulTheme) -> Option<bool> {
     Confirm::with_theme(theme)
         .with_prompt(format!(
@@ -222,8 +205,6 @@ fn prompt_for_dev_skill(theme: &ColorfulTheme) -> Option<bool> {
         .ok()
 }
 
-/// Failures ignored the way `spawn_dev_skill_install` ignores its own: a marker that
-/// would not write costs one more prompt later, not a failed scaffold now.
 fn record_dev_skill_declined(home: &Path) {
     let marker = home.join(DEV_SKILL_DECLINED_MARKER);
     if let Some(parent) = marker.parent() {
@@ -232,10 +213,9 @@ fn record_dev_skill_declined(home: &Path) {
     let _ = File::create(marker);
 }
 
-/// The gate, in the order that decides it: an install already on disk and a recorded
-/// no both outrank `--yes`, so a second scaffold stays silent and a machine that has
-/// declined once is never asked again. `ask` is reached only when nothing on disk has
-/// already answered. Paths are arguments so this is testable without a home directory.
+/// An install already on disk and a recorded no both outrank `--yes`, so a second scaffold stays
+/// silent and a machine that has declined once is never asked again. Paths are arguments so the
+/// gate is testable without a real home directory.
 fn dev_skill_install_if_wanted(
     base_location: &FileLocation,
     base: &Path,
@@ -638,8 +618,8 @@ pub fn scaffold_iac_layout(
         println!("Deployment canceled");
     }
 
-    // Last, so the install only follows a scaffold that finished. No longer keyed to
-    // `confirmation`: declining the deployment is "not now", and never was "never".
+    // Last, so the install only follows a scaffold that finished, and deliberately not keyed to
+    // `confirmation`: declining the deployment is "not now", not "never".
     let home = get_home_dir();
     let base = base_location.expect_path_buf();
     if let Some(command) = dev_skill_install_if_wanted(

@@ -145,7 +145,7 @@ const DEV_SKILL_REPO: &str = "https://github.com/solana-foundation/solana-dev-sk
 /// at the moment of someone's first scaffold, which is not a thing this can
 /// promise anyone. An exact version is the only form that resolves the same way
 /// twice; a range still floats to the newest release inside it.
-const DEV_SKILL_INSTALLER: &str = "skills@1.5.22";
+const DEV_SKILL_INSTALLER: &str = "skills@1.5.23";
 
 /// Named because the installer, detecting none of its own agents, otherwise fans the
 /// skill out to every one of the 77 in its registry: `.claude/`, a non-hidden `agent/`

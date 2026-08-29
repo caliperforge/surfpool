@@ -235,6 +235,7 @@ fn dev_skill_install_if_wanted(
                 record_dev_skill_declined(home);
                 false
             }
+            // A prompt that could not be shown is not an answer, so nothing is recorded.
             None => false,
         },
     };
@@ -796,6 +797,18 @@ mod tests {
         assert!(
             dev_skill_install_if_wanted(&location, base.path(), home.path(), false, || Some(true))
                 .is_some()
+        );
+        assert!(!home.path().join(DEV_SKILL_DECLINED_MARKER).exists());
+    }
+
+    /// A prompt that could not be shown is not a decline, so it is not remembered as one and
+    /// the next scaffold still asks.
+    #[test]
+    fn an_undisplayable_prompt_installs_nothing_and_records_nothing() {
+        let (base, home, location) = scratch();
+        assert!(
+            dev_skill_install_if_wanted(&location, base.path(), home.path(), false, || None)
+                .is_none()
         );
         assert!(!home.path().join(DEV_SKILL_DECLINED_MARKER).exists());
     }

@@ -1,6 +1,7 @@
 use std::{
     env,
     fs::{self, File},
+    path::Path,
     process::{Command, Stdio},
 };
 
@@ -19,7 +20,10 @@ use txtx_core::{
     types::RunbookSources,
 };
 
-use crate::{cli::DEFAULT_SOLANA_KEYPAIR_PATH, types::Framework};
+use crate::{
+    cli::{DEFAULT_SOLANA_KEYPAIR_PATH, get_home_dir},
+    types::Framework,
+};
 
 pub const SURFPOOL_README_TEMPLATE: &str = include_str!("./templates/readme.md.mst");
 
@@ -143,8 +147,22 @@ const DEV_SKILL_REPO: &str = "https://github.com/solana-foundation/solana-dev-sk
 /// twice; a range still floats to the newest release inside it.
 const DEV_SKILL_INSTALLER: &str = "skills@1.5.22";
 
-/// Builds the skill install as issue #567 specifies it, pinned, and rooted at
-/// the project being scaffolded rather than wherever the process happens to sit.
+/// Named because the installer, detecting none of its own agents, otherwise fans the
+/// skill out to every one of the 77 in its registry: `.claude/`, a non-hidden `agent/`
+/// and a lock file all land in a project that asked for none of them. `universal` is
+/// its own registry key for the canonical `.agents/skills` copy and symlinks nowhere.
+const DEV_SKILL_AGENT: &str = "universal";
+
+/// Where `universal` puts the skill, under the project or under a home that took it
+/// globally.
+const DEV_SKILL_DIR: &str = ".agents/skills/solana-dev";
+
+/// A remembered "no". Its existence is the whole answer, so deleting it asks again.
+const DEV_SKILL_DECLINED_MARKER: &str = ".config/surfpool/dev-skill-declined";
+
+/// Builds the skill install as issue #567 specifies it, pinned, restricted to the one
+/// agent whose layout the prompt names, and rooted at the project being scaffolded
+/// rather than wherever the process happens to sit.
 fn dev_skill_install_command(base_location: &FileLocation) -> Command {
     let mut command = Command::new("npx");
     command.args([
@@ -154,6 +172,8 @@ fn dev_skill_install_command(base_location: &FileLocation) -> Command {
         DEV_SKILL_REPO,
         "--skill",
         "*",
+        "--agent",
+        DEV_SKILL_AGENT,
         "-y",
     ]);
     command.current_dir(base_location.expect_path_buf());
@@ -180,11 +200,64 @@ fn spawn_dev_skill_install(mut command: Command) {
     });
 }
 
-/// The install that follows the confirmation, or nothing. A declined
-/// confirmation cancels the deployment, and the install is part of what it
-/// cancels.
-fn install_after_confirmation(confirmation: bool, base_location: &FileLocation) -> Option<Command> {
-    confirmation.then(|| dev_skill_install_command(base_location))
+/// Both scopes the install can already have happened in: this project, or a home
+/// that took the skill globally.
+fn dev_skill_installed(base: &Path, home: &Path) -> bool {
+    base.join(DEV_SKILL_DIR).exists() || home.join(DEV_SKILL_DIR).exists()
+}
+
+fn dev_skill_declined(home: &Path) -> bool {
+    home.join(DEV_SKILL_DECLINED_MARKER).exists()
+}
+
+/// `None` when the prompt could not be put on screen at all, which is not an answer
+/// and so is not remembered.
+fn prompt_for_dev_skill(theme: &ColorfulTheme) -> Option<bool> {
+    Confirm::with_theme(theme)
+        .with_prompt(format!(
+            "Install the solana-dev skill? It writes {DEV_SKILL_DIR} and skills-lock.json here"
+        ))
+        .default(true)
+        .interact()
+        .ok()
+}
+
+/// Failures ignored the way `spawn_dev_skill_install` ignores its own: a marker that
+/// would not write costs one more prompt later, not a failed scaffold now.
+fn record_dev_skill_declined(home: &Path) {
+    let marker = home.join(DEV_SKILL_DECLINED_MARKER);
+    if let Some(parent) = marker.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = File::create(marker);
+}
+
+/// The gate, in the order that decides it: an install already on disk and a recorded
+/// no both outrank `--yes`, so a second scaffold stays silent and a machine that has
+/// declined once is never asked again. `ask` is reached only when nothing on disk has
+/// already answered. Paths are arguments so this is testable without a home directory.
+fn dev_skill_install_if_wanted(
+    base_location: &FileLocation,
+    base: &Path,
+    home: &Path,
+    auto_accept: bool,
+    ask: impl FnOnce() -> Option<bool>,
+) -> Option<Command> {
+    if dev_skill_installed(base, home) || dev_skill_declined(home) {
+        return None;
+    }
+    let consented = match auto_accept {
+        true => true,
+        false => match ask() {
+            Some(true) => true,
+            Some(false) => {
+                record_dev_skill_declined(home);
+                false
+            }
+            None => false,
+        },
+    };
+    consented.then(|| dev_skill_install_command(base_location))
 }
 
 pub fn scaffold_in_memory_iac(
@@ -565,9 +638,19 @@ pub fn scaffold_iac_layout(
         println!("Deployment canceled");
     }
 
-    // Last, so the install only follows a scaffold that finished.
-    if let Some(command) = install_after_confirmation(confirmation, base_location) {
+    // Last, so the install only follows a scaffold that finished. No longer keyed to
+    // `confirmation`: declining the deployment is "not now", and never was "never".
+    let home = get_home_dir();
+    let base = base_location.expect_path_buf();
+    if let Some(command) = dev_skill_install_if_wanted(
+        base_location,
+        &base,
+        Path::new(&home),
+        auto_generate_runbooks,
+        || prompt_for_dev_skill(&theme),
+    ) {
         spawn_dev_skill_install(command);
+        println!("{} {}", green!("Installing"), DEV_SKILL_DIR);
     }
 
     Ok(())
@@ -576,15 +659,27 @@ pub fn scaffold_iac_layout(
 #[cfg(test)]
 mod tests {
     use std::{
+        fs::{self, File},
         path::Path,
         process::Command,
         time::{Duration, Instant},
     };
 
+    use tempfile::TempDir;
+
     use super::{
-        DEV_SKILL_INSTALLER, DEV_SKILL_REPO, FileLocation, dev_skill_install_command,
-        install_after_confirmation, spawn_dev_skill_install,
+        DEV_SKILL_AGENT, DEV_SKILL_DECLINED_MARKER, DEV_SKILL_DIR, DEV_SKILL_INSTALLER,
+        DEV_SKILL_REPO, FileLocation, dev_skill_install_command, dev_skill_install_if_wanted,
+        spawn_dev_skill_install,
     };
+
+    /// Every gate test runs against these, never a real home directory.
+    fn scratch() -> (TempDir, TempDir, FileLocation) {
+        let base = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let location = FileLocation::from_path_string(base.path().to_str().unwrap()).unwrap();
+        (base, home, location)
+    }
 
     #[cfg(unix)]
     fn sh(script: &str) -> Command {
@@ -611,9 +706,14 @@ mod tests {
                 DEV_SKILL_REPO,
                 "--skill",
                 "*",
+                "--agent",
+                DEV_SKILL_AGENT,
                 "-y"
             ]
         );
+        // "*" is the installer's own alias for every agent it knows, so naming one
+        // agent and naming all of them are one typo apart.
+        assert_ne!(DEV_SKILL_AGENT, "*");
         let (package, version) = DEV_SKILL_INSTALLER
             .split_once('@')
             .expect("installer is pinned");
@@ -639,13 +739,84 @@ mod tests {
         );
     }
 
-    /// Declining the confirmation cancels the deployment, and the install is
-    /// part of what it cancels. Nothing is built, so nothing is spawned.
+    /// A skill already on disk is the reviewer's first item: say nothing, do nothing.
+    /// Either scope counts, since a globally installed skill is already available here.
     #[test]
-    fn a_declined_confirmation_starts_no_install() {
-        let base = FileLocation::from_path_string("/tmp/surfpool-567-scaffold").unwrap();
-        assert!(install_after_confirmation(false, &base).is_none());
-        assert!(install_after_confirmation(true, &base).is_some());
+    fn an_installed_skill_is_left_alone() {
+        for (in_base, in_home) in [(true, false), (false, true)] {
+            let (base, home, location) = scratch();
+            let root = if in_base { base.path() } else { home.path() };
+            fs::create_dir_all(root.join(DEV_SKILL_DIR)).unwrap();
+            assert!(
+                dev_skill_install_if_wanted(&location, base.path(), home.path(), true, || {
+                    panic!("an installed skill must not prompt")
+                })
+                .is_none(),
+                "installed in base={in_base} home={in_home} still produced an install"
+            );
+        }
+    }
+
+    /// The remembered no, and the reason it is checked before `--yes` rather than
+    /// after: "never" has to survive the flag, or a CI machine relitigates it hourly.
+    #[test]
+    fn a_recorded_decline_outranks_the_yes_flag() {
+        let (base, home, location) = scratch();
+        let marker = home.path().join(DEV_SKILL_DECLINED_MARKER);
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        File::create(&marker).unwrap();
+        assert!(
+            dev_skill_install_if_wanted(&location, base.path(), home.path(), true, || {
+                panic!("a recorded decline must not prompt")
+            })
+            .is_none()
+        );
+    }
+
+    /// `--yes` is the codebase's existing "answered in advance", so with nothing on
+    /// disk saying otherwise it installs without prompting.
+    #[test]
+    fn the_yes_flag_installs_without_prompting() {
+        let (base, home, location) = scratch();
+        assert!(
+            dev_skill_install_if_wanted(&location, base.path(), home.path(), true, || {
+                panic!("--yes must not prompt")
+            })
+            .is_some()
+        );
+    }
+
+    /// The property the old confirmation test guarded, re-expressed against the gate
+    /// that replaced it: a no starts no install. It now also has to be remembered.
+    #[test]
+    fn a_declined_prompt_starts_no_install_and_is_remembered() {
+        let (base, home, location) = scratch();
+        assert!(
+            dev_skill_install_if_wanted(&location, base.path(), home.path(), false, || Some(false))
+                .is_none()
+        );
+        assert!(
+            home.path().join(DEV_SKILL_DECLINED_MARKER).exists(),
+            "a decline that is not written down is a decline that gets asked again"
+        );
+        assert!(
+            dev_skill_install_if_wanted(&location, base.path(), home.path(), false, || {
+                panic!("the recorded decline must not prompt again")
+            })
+            .is_none()
+        );
+    }
+
+    /// Accepting is the only path that installs, and a yes is deliberately not
+    /// written down: installs are per project, so the question is asked per project.
+    #[test]
+    fn an_accepted_prompt_installs_and_records_nothing() {
+        let (base, home, location) = scratch();
+        assert!(
+            dev_skill_install_if_wanted(&location, base.path(), home.path(), false, || Some(true))
+                .is_some()
+        );
+        assert!(!home.path().join(DEV_SKILL_DECLINED_MARKER).exists());
     }
 
     /// The three ways this goes wrong on a real machine: no Node at all, an

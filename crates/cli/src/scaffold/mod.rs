@@ -739,33 +739,28 @@ mod tests {
         }
     }
 
-    /// The remembered no, and the reason it is checked before `--yes` rather than
-    /// after: "never" has to survive the flag, or a CI machine relitigates it hourly.
+    /// Under `--yes`, the marker decides. The remembered no is read before the flag rather
+    /// than after, or a CI machine relitigates it hourly; absent one, `--yes` is the
+    /// codebase's existing "answered in advance". Neither case may reach the prompt.
     #[test]
-    fn a_recorded_decline_outranks_the_yes_flag() {
-        let (base, home, location) = scratch();
-        let marker = home.path().join(DEV_SKILL_DECLINED_MARKER);
-        fs::create_dir_all(marker.parent().unwrap()).unwrap();
-        File::create(&marker).unwrap();
-        assert!(
-            dev_skill_install_if_wanted(&location, base.path(), home.path(), true, || {
-                panic!("a recorded decline must not prompt")
-            })
-            .is_none()
-        );
-    }
-
-    /// `--yes` is the codebase's existing "answered in advance", so with nothing on
-    /// disk saying otherwise it installs without prompting.
-    #[test]
-    fn the_yes_flag_installs_without_prompting() {
-        let (base, home, location) = scratch();
-        assert!(
-            dev_skill_install_if_wanted(&location, base.path(), home.path(), true, || {
-                panic!("--yes must not prompt")
-            })
-            .is_some()
-        );
+    fn under_the_yes_flag_the_marker_decides() {
+        for declined in [true, false] {
+            let (base, home, location) = scratch();
+            if declined {
+                let marker = home.path().join(DEV_SKILL_DECLINED_MARKER);
+                fs::create_dir_all(marker.parent().unwrap()).unwrap();
+                File::create(&marker).unwrap();
+            }
+            let install =
+                dev_skill_install_if_wanted(&location, base.path(), home.path(), true, || {
+                    panic!("--yes must not prompt")
+                });
+            assert_eq!(
+                install.is_none(),
+                declined,
+                "--yes with a recorded decline={declined} decided the wrong way"
+            );
+        }
     }
 
     /// The property the old confirmation test guarded, re-expressed against the gate

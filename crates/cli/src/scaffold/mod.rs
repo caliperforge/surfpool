@@ -670,10 +670,8 @@ mod tests {
         command
     }
 
-    /// #567 supplied this invocation literally: the `-y` flags keep it off a
-    /// prompt and `--skill "*"` is what makes it the whole bundle. The one
-    /// departure from its text is the pinned version, which is here in full so
-    /// that dropping the pin has to fail this.
+    /// #567 supplied this invocation literally. The one departure from its text is the
+    /// pinned version, which is here in full so that dropping the pin has to fail this.
     #[test]
     fn the_install_is_the_command_issue_567_asked_for() {
         let base = FileLocation::from_path_string("/tmp/surfpool-567-scaffold").unwrap();
@@ -709,9 +707,8 @@ mod tests {
         );
     }
 
-    /// The install writes into the project being scaffolded, which is the
-    /// manifest's directory rather than the shell's. `surfpool start -m
-    /// ../elsewhere/txtx.yml` scaffolds a tree the caller is not standing in.
+    /// `surfpool start -m ../elsewhere/txtx.yml` scaffolds a tree the caller is not standing in,
+    /// so the manifest's directory is the target and the shell's is not.
     #[test]
     fn the_install_runs_in_the_scaffolded_project_not_the_process_cwd() {
         let base = FileLocation::from_path_string("/tmp/surfpool-567-scaffold").unwrap();
@@ -763,8 +760,8 @@ mod tests {
         }
     }
 
-    /// The property the old confirmation test guarded, re-expressed against the gate
-    /// that replaced it: a no starts no install. It now also has to be remembered.
+    /// The property the old confirmation test guarded, re-expressed against the gate that
+    /// replaced it, with the memory the gate added.
     #[test]
     fn a_declined_prompt_starts_no_install_and_is_remembered() {
         let (base, home, location) = scratch();
@@ -784,8 +781,8 @@ mod tests {
         );
     }
 
-    /// Accepting is the only path that installs, and a yes is deliberately not
-    /// written down: installs are per project, so the question is asked per project.
+    /// A yes is deliberately not written down: installs are per project, so the question is
+    /// asked per project.
     #[test]
     fn an_accepted_prompt_installs_and_records_nothing() {
         let (base, home, location) = scratch();
@@ -808,10 +805,8 @@ mod tests {
         assert!(!home.path().join(DEV_SKILL_DECLINED_MARKER).exists());
     }
 
-    /// The three ways this goes wrong on a real machine: no Node at all, an
-    /// install that fails, an install that hangs. Each returns at once and
-    /// returns nothing, so the scaffold has neither a value to branch on nor a
-    /// wait to be held by — its result and its output are the same either way.
+    /// The three ways this goes wrong on a real machine, in order: no Node at all, an install
+    /// that fails, an install that hangs. The scaffold is held by none of them.
     #[cfg(unix)]
     #[test]
     fn no_outcome_of_the_install_reaches_the_scaffold() {

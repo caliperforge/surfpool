@@ -154,6 +154,8 @@ const DEV_SKILL_DIR: &str = ".agents/skills/solana-dev";
 
 const DEV_SKILL_DECLINED_MARKER: &str = ".config/surfpool/dev-skill-declined";
 
+const DEV_SKILL_ACCEPTED_MARKER: &str = ".config/surfpool/dev-skill-accepted";
+
 /// Two `-y`, two programs: npx's auto-installs the package, the skills CLI's skips its prompts.
 fn dev_skill_install_command(base_location: &FileLocation) -> Command {
     let mut command = Command::new("npx");
@@ -192,8 +194,16 @@ fn dev_skill_installed(base: &Path, home: &Path) -> bool {
     base.join(DEV_SKILL_DIR).exists() || home.join(DEV_SKILL_DIR).exists()
 }
 
-fn dev_skill_declined(home: &Path) -> bool {
-    home.join(DEV_SKILL_DECLINED_MARKER).exists()
+/// Both answers are ours to keep: `DEV_SKILL_DIR` is written by an installer we neither wait on
+/// nor control, so a yes inferred from it is a yes asked again forever. A no wins a split pair.
+fn dev_skill_answer(home: &Path) -> Option<bool> {
+    if home.join(DEV_SKILL_DECLINED_MARKER).exists() {
+        Some(false)
+    } else if home.join(DEV_SKILL_ACCEPTED_MARKER).exists() {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 fn prompt_for_dev_skill(theme: &ColorfulTheme) -> Option<bool> {
@@ -201,21 +211,23 @@ fn prompt_for_dev_skill(theme: &ColorfulTheme) -> Option<bool> {
         .with_prompt(format!(
             "Install the solana-dev skill? It writes {DEV_SKILL_DIR} and skills-lock.json here"
         ))
-        .default(true)
+        .default(false)
         .interact()
         .ok()
 }
 
-fn record_dev_skill_declined(home: &Path) {
-    let marker = home.join(DEV_SKILL_DECLINED_MARKER);
+fn record_dev_skill_answer(home: &Path, consented: bool) {
+    let marker = home.join(match consented {
+        true => DEV_SKILL_ACCEPTED_MARKER,
+        false => DEV_SKILL_DECLINED_MARKER,
+    });
     if let Some(parent) = marker.parent() {
         let _ = fs::create_dir_all(parent);
     }
     let _ = File::create(marker);
 }
 
-/// An install already on disk and a recorded no both outrank `--yes`, so a second scaffold stays
-/// silent and a machine that has declined once is never asked again. Paths are arguments so the
+/// A recorded answer and an install on disk both outrank `--yes`. Paths are arguments so the
 /// gate is testable without a real home directory.
 fn dev_skill_install_if_wanted(
     base_location: &FileLocation,
@@ -224,16 +236,16 @@ fn dev_skill_install_if_wanted(
     auto_accept: bool,
     ask: impl FnOnce() -> Option<bool>,
 ) -> Option<Command> {
-    if dev_skill_installed(base, home) || dev_skill_declined(home) {
+    if dev_skill_installed(base, home) {
         return None;
     }
-    let consented = match auto_accept {
-        true => true,
-        false => match ask() {
-            Some(true) => true,
-            Some(false) => {
-                record_dev_skill_declined(home);
-                false
+    let consented = match dev_skill_answer(home) {
+        Some(recorded) => recorded,
+        None if auto_accept => true,
+        None => match ask() {
+            Some(answer) => {
+                record_dev_skill_answer(home, answer);
+                answer
             }
             // A prompt that could not be shown is not an answer, so nothing is recorded.
             None => false,
@@ -632,7 +644,7 @@ pub fn scaffold_iac_layout(
         || prompt_for_dev_skill(&theme),
     ) {
         spawn_dev_skill_install(command);
-        println!("{} {}", green!("Installing"), DEV_SKILL_DIR);
+        println!("{} {}", green!("Started installer for"), DEV_SKILL_DIR);
     }
 
     Ok(())
@@ -651,8 +663,8 @@ mod tests {
 
     use super::{
         DEV_SKILL_AGENT, DEV_SKILL_DECLINED_MARKER, DEV_SKILL_DIR, DEV_SKILL_INSTALLER,
-        DEV_SKILL_REPO, FileLocation, dev_skill_install_command, dev_skill_install_if_wanted,
-        spawn_dev_skill_install,
+        DEV_SKILL_REPO, FileLocation, dev_skill_answer, dev_skill_install_command,
+        dev_skill_install_if_wanted, spawn_dev_skill_install,
     };
 
     /// Every gate test runs against these, never a real home directory.
@@ -781,16 +793,21 @@ mod tests {
         );
     }
 
-    /// A yes is deliberately not written down: installs are per project, so the question is
-    /// asked per project.
+    /// The install writes a directory a third party owns, and #567's own installer currently
+    /// writes none, so a yes not written down here is a yes asked again on every scaffold.
     #[test]
-    fn an_accepted_prompt_installs_and_records_nothing() {
+    fn an_accepted_prompt_installs_and_is_remembered() {
         let (base, home, location) = scratch();
         assert!(
             dev_skill_install_if_wanted(&location, base.path(), home.path(), false, || Some(true))
                 .is_some()
         );
-        assert!(!home.path().join(DEV_SKILL_DECLINED_MARKER).exists());
+        assert!(
+            dev_skill_install_if_wanted(&location, base.path(), home.path(), false, || {
+                panic!("the recorded accept must not prompt again")
+            })
+            .is_some()
+        );
     }
 
     /// A prompt that could not be shown is not a decline, so it is not remembered as one and
@@ -802,7 +819,7 @@ mod tests {
             dev_skill_install_if_wanted(&location, base.path(), home.path(), false, || None)
                 .is_none()
         );
-        assert!(!home.path().join(DEV_SKILL_DECLINED_MARKER).exists());
+        assert!(dev_skill_answer(home.path()).is_none());
     }
 
     /// The three ways this goes wrong on a real machine, in order: no Node at all, an install

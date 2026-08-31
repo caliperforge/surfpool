@@ -221,6 +221,7 @@ fn record_dev_skill_answer(home: &Path, consented: bool) {
     let _ = File::create(marker);
 }
 
+/// Returns the command to install the solana-dev skill, or `None` if it should not be installed.
 fn dev_skill_install_if_wanted(
     base_location: &FileLocation,
     base: &Path,

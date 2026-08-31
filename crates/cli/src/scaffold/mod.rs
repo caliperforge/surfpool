@@ -643,13 +643,17 @@ pub fn scaffold_iac_layout(
 
 #[cfg(test)]
 mod tests {
-    use std::fs::{self, File};
+    use std::{
+        fs::{self, File},
+        process::Command,
+        time::{Duration, Instant},
+    };
 
     use tempfile::TempDir;
 
     use super::{
         DEV_SKILL_ACCEPTED_MARKER, DEV_SKILL_DECLINED_MARKER, DEV_SKILL_DIR, FileLocation,
-        dev_skill_answer, dev_skill_install_if_wanted,
+        dev_skill_answer, dev_skill_install_if_wanted, spawn_dev_skill_install,
     };
 
     fn scratch() -> (TempDir, TempDir, FileLocation) {
@@ -657,6 +661,13 @@ mod tests {
         let home = TempDir::new().unwrap();
         let location = FileLocation::from_path_string(base.path().to_str().unwrap()).unwrap();
         (base, home, location)
+    }
+
+    #[cfg(unix)]
+    fn sh(script: &str) -> Command {
+        let mut command = Command::new("sh");
+        command.args(["-c", script]);
+        command
     }
 
     #[test]
@@ -745,5 +756,20 @@ mod tests {
                 .is_none()
         );
         assert!(dev_skill_answer(home.path()).is_none());
+    }
+
+    /// An install that is missing, fails, or hangs does not delay the scaffold.
+    #[cfg(unix)]
+    #[test]
+    fn no_outcome_of_the_install_reaches_the_scaffold() {
+        let started = Instant::now();
+        spawn_dev_skill_install(Command::new("surfpool-567-no-such-binary"));
+        spawn_dev_skill_install(sh("exit 1"));
+        spawn_dev_skill_install(sh("sleep 30"));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the scaffold waited on the install: {:?}",
+            started.elapsed()
+        );
     }
 }

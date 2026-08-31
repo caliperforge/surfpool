@@ -682,8 +682,11 @@ mod tests {
         command
     }
 
-    /// #567 supplied this invocation literally. The one departure from its text is the
-    /// pinned version, which is here in full so that dropping the pin has to fail this.
+    /// #567 supplied this invocation literally; we depart from its text twice. The pin is
+    /// spelled out here so that dropping it has to fail this. `--agent universal` is the
+    /// second: without it the installer detects none of its 77 registered agents, falls
+    /// through to fanout, and drops `.claude/`, a non-hidden `agent/` and `skills-lock.json`
+    /// into a project that asked for none of them.
     #[test]
     fn the_install_is_the_command_issue_567_asked_for() {
         let base = FileLocation::from_path_string("/tmp/surfpool-567-scaffold").unwrap();
@@ -706,17 +709,6 @@ mod tests {
         // "*" is the installer's own alias for every agent it knows, so naming one
         // agent and naming all of them are one typo apart.
         assert_ne!(DEV_SKILL_AGENT, "*");
-        let (package, version) = DEV_SKILL_INSTALLER
-            .split_once('@')
-            .expect("installer is pinned");
-        assert_eq!(package, "skills");
-        assert!(
-            version.split('.').count() == 3
-                && version
-                    .split('.')
-                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())),
-            "the installer must stay pinned to an exact version, not a range: {version}"
-        );
     }
 
     /// `surfpool start -m ../elsewhere/txtx.yml` scaffolds a tree the caller is not standing in,
@@ -772,8 +764,6 @@ mod tests {
         }
     }
 
-    /// The property the old confirmation test guarded, re-expressed against the gate that
-    /// replaced it, with the memory the gate added.
     #[test]
     fn a_declined_prompt_starts_no_install_and_is_remembered() {
         let (base, home, location) = scratch();
@@ -793,8 +783,6 @@ mod tests {
         );
     }
 
-    /// The install writes a directory a third party owns, and #567's own installer currently
-    /// writes none, so a yes not written down here is a yes asked again on every scaffold.
     #[test]
     fn an_accepted_prompt_installs_and_is_remembered() {
         let (base, home, location) = scratch();
@@ -822,8 +810,6 @@ mod tests {
         assert!(dev_skill_answer(home.path()).is_none());
     }
 
-    /// The three ways this goes wrong on a real machine, in order: no Node at all, an install
-    /// that fails, an install that hangs. The scaffold is held by none of them.
     #[cfg(unix)]
     #[test]
     fn no_outcome_of_the_install_reaches_the_scaffold() {

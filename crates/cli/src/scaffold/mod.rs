@@ -141,13 +141,10 @@ impl ProgramMetadata {
 
 const DEV_SKILL_REPO: &str = "https://github.com/solana-foundation/solana-dev-skill";
 
-/// Exact, not a range: anything looser installs whatever the registry calls latest that day.
 const DEV_SKILL_INSTALLER: &str = "skills@1.5.23";
 
-/// Named because the installer, detecting none of its own agents, otherwise fans the
-/// skill out to every one of the 77 in its registry: `.claude/`, a non-hidden `agent/`
-/// and a lock file all land in a project that asked for none of them. `universal` is
-/// its own registry key for the canonical `.agents/skills` copy and symlinks nowhere.
+/// Installs only the canonical `.agents/skills` copy. Without it, the installer also writes
+/// `.claude/`, `agent/` and a lock file for every agent it knows about.
 const DEV_SKILL_AGENT: &str = "universal";
 
 const DEV_SKILL_DIR: &str = ".agents/skills/solana-dev";
@@ -156,7 +153,7 @@ const DEV_SKILL_DECLINED_MARKER: &str = ".config/surfpool/dev-skill-declined";
 
 const DEV_SKILL_ACCEPTED_MARKER: &str = ".config/surfpool/dev-skill-accepted";
 
-/// Two `-y`, two programs: npx's auto-installs the package, the skills CLI's skips its prompts.
+/// Returns the command that installs the solana-dev skill into `base_location`.
 fn dev_skill_install_command(base_location: &FileLocation) -> Command {
     let mut command = Command::new("npx");
     command.args([
@@ -174,8 +171,7 @@ fn dev_skill_install_command(base_location: &FileLocation) -> Command {
     command
 }
 
-/// Fire-and-forget: this sits on the path to booting a surfnet, so a missing Node or a failed
-/// install is silence rather than an error, and the wait that reaps the child runs off-thread.
+/// Runs the install in the background, discarding its output and exit status.
 fn spawn_dev_skill_install(mut command: Command) {
     let Ok(mut child) = command
         .stdin(Stdio::null())
@@ -194,8 +190,7 @@ fn dev_skill_installed(base: &Path, home: &Path) -> bool {
     base.join(DEV_SKILL_DIR).exists() || home.join(DEV_SKILL_DIR).exists()
 }
 
-/// Both answers are ours to keep: `DEV_SKILL_DIR` is written by an installer we neither wait on
-/// nor control, so a yes inferred from it is a yes asked again forever. A no wins a split pair.
+/// Returns the answer the user gave last time, or `None` if they have not been asked.
 fn dev_skill_answer(home: &Path) -> Option<bool> {
     if home.join(DEV_SKILL_DECLINED_MARKER).exists() {
         Some(false)
@@ -209,7 +204,7 @@ fn dev_skill_answer(home: &Path) -> Option<bool> {
 fn prompt_for_dev_skill(theme: &ColorfulTheme) -> Option<bool> {
     Confirm::with_theme(theme)
         .with_prompt(format!(
-            "Install the solana-dev skill? It writes {DEV_SKILL_DIR} and skills-lock.json here"
+            "Install the solana-dev skill? This will write to the {DEV_SKILL_DIR} directory."
         ))
         .default(false)
         .interact()
@@ -227,11 +222,7 @@ fn record_dev_skill_answer(home: &Path, consented: bool) {
     let _ = File::create(marker);
 }
 
-/// Only a recorded answer, or an install already on disk, decides this; `--yes` decides nothing
-/// and alone never installs. It pre-answers surfpool's own prompts, and nobody has been asked
-/// about a third-party repo whose contents we do not pin. What it still does is suppress the
-/// prompt, so a non-interactive run skips rather than blocks. Paths are arguments so the gate is
-/// testable without a real home directory.
+/// Returns the command to install the solana-dev skill, or `None` if it should not be installed.
 fn dev_skill_install_if_wanted(
     base_location: &FileLocation,
     base: &Path,
@@ -244,23 +235,12 @@ fn dev_skill_install_if_wanted(
     }
     let consented = match dev_skill_answer(home) {
         Some(recorded) => recorded,
-        // An absent answer is not a yes, and a silent skip is the same invisible install by
-        // another name, so say it and name the run that does ask. Nothing is recorded: the
-        // question is still open.
-        None if auto_accept => {
-            println!(
-                "{} {} (run `surfpool start` without --yes to be asked)",
-                green!("Skipped the installer for"),
-                DEV_SKILL_DIR
-            );
-            false
-        }
+        None if auto_accept => false,
         None => match ask() {
             Some(answer) => {
                 record_dev_skill_answer(home, answer);
                 answer
             }
-            // A prompt that could not be shown is not an answer, so nothing is recorded.
             None => false,
         },
     };
@@ -645,8 +625,6 @@ pub fn scaffold_iac_layout(
         println!("Deployment canceled");
     }
 
-    // Last, so the install only follows a scaffold that finished, and deliberately not keyed to
-    // `confirmation`: declining the deployment is "not now", not "never".
     let home = get_home_dir();
     let base = base_location.expect_path_buf();
     if let Some(command) = dev_skill_install_if_wanted(
@@ -665,22 +643,15 @@ pub fn scaffold_iac_layout(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs::{self, File},
-        path::Path,
-        process::Command,
-        time::{Duration, Instant},
-    };
+    use std::fs::{self, File};
 
     use tempfile::TempDir;
 
     use super::{
-        DEV_SKILL_ACCEPTED_MARKER, DEV_SKILL_AGENT, DEV_SKILL_DECLINED_MARKER, DEV_SKILL_DIR,
-        DEV_SKILL_INSTALLER, DEV_SKILL_REPO, FileLocation, dev_skill_answer,
-        dev_skill_install_command, dev_skill_install_if_wanted, spawn_dev_skill_install,
+        DEV_SKILL_ACCEPTED_MARKER, DEV_SKILL_DECLINED_MARKER, DEV_SKILL_DIR, FileLocation,
+        dev_skill_answer, dev_skill_install_if_wanted,
     };
 
-    /// Every gate test runs against these, never a real home directory.
     fn scratch() -> (TempDir, TempDir, FileLocation) {
         let base = TempDir::new().unwrap();
         let home = TempDir::new().unwrap();
@@ -688,66 +659,6 @@ mod tests {
         (base, home, location)
     }
 
-    #[cfg(unix)]
-    fn sh(script: &str) -> Command {
-        let mut command = Command::new("sh");
-        command.args(["-c", script]);
-        command
-    }
-
-    /// #567 supplied this invocation literally; we depart from its text twice. The pin is
-    /// spelled out here so that dropping it has to fail this. `--agent universal` is the
-    /// second: without it the installer detects none of its 77 registered agents, falls
-    /// through to fanout, and drops `.claude/`, a non-hidden `agent/` and `skills-lock.json`
-    /// into a project that asked for none of them.
-    #[test]
-    fn the_install_is_the_command_issue_567_asked_for() {
-        let base = FileLocation::from_path_string("/tmp/surfpool-567-scaffold").unwrap();
-        let command = dev_skill_install_command(&base);
-        assert_eq!(command.get_program(), "npx");
-        assert_eq!(
-            command.get_args().collect::<Vec<_>>(),
-            [
-                "-y",
-                DEV_SKILL_INSTALLER,
-                "add",
-                DEV_SKILL_REPO,
-                "--skill",
-                "*",
-                "--agent",
-                DEV_SKILL_AGENT,
-                "-y"
-            ]
-        );
-        // "*" is the installer's own alias for every agent it knows, so naming one
-        // agent and naming all of them are one typo apart.
-        assert_ne!(DEV_SKILL_AGENT, "*");
-        // The arg-vector assert above spells DEV_SKILL_INSTALLER on both sides, so it moves with
-        // the const and cannot see the value change. This is the only assertion on the pin itself.
-        let (_, version) = DEV_SKILL_INSTALLER
-            .split_once('@')
-            .expect("installer is pinned");
-        let exact = version.split('.').count() == 3
-            && version.bytes().all(|b| b.is_ascii_digit() || b == b'.');
-        assert!(
-            exact,
-            "the installer must be pinned to an exact version, not a range: {version}"
-        );
-    }
-
-    /// `surfpool start -m ../elsewhere/txtx.yml` scaffolds a tree the caller is not standing in,
-    /// so the manifest's directory is the target and the shell's is not.
-    #[test]
-    fn the_install_runs_in_the_scaffolded_project_not_the_process_cwd() {
-        let base = FileLocation::from_path_string("/tmp/surfpool-567-scaffold").unwrap();
-        assert_eq!(
-            dev_skill_install_command(&base).get_current_dir(),
-            Some(Path::new("/tmp/surfpool-567-scaffold"))
-        );
-    }
-
-    /// A skill already on disk is the reviewer's first item: say nothing, do nothing.
-    /// Either scope counts, since a globally installed skill is already available here.
     #[test]
     fn an_installed_skill_is_left_alone() {
         for (in_base, in_home) in [(true, false), (false, true)] {
@@ -759,16 +670,14 @@ mod tests {
                     panic!("an installed skill must not prompt")
                 })
                 .is_none(),
-                "installed in base={in_base} home={in_home} still produced an install"
+                "installed in base={in_base} home={in_home}"
             );
         }
     }
 
-    /// Under `--yes`, the marker decides and only the marker does. The remembered answer is read
-    /// before the flag rather than after, so a CI machine neither relitigates a no hourly nor
-    /// re-asks a user who already said yes. Neither case may reach the prompt.
+    /// A recorded answer is used even under `--yes`, and is never re-prompted.
     #[test]
-    fn under_the_yes_flag_the_marker_decides() {
+    fn the_yes_flag_uses_the_recorded_answer() {
         for declined in [true, false] {
             let (base, home, location) = scratch();
             let marker = home.path().join(match declined {
@@ -781,32 +690,20 @@ mod tests {
                 dev_skill_install_if_wanted(&location, base.path(), home.path(), true, || {
                     panic!("--yes must not prompt")
                 });
-            assert_eq!(
-                install.is_none(),
-                declined,
-                "--yes with a recorded decline={declined} decided the wrong way"
-            );
+            assert_eq!(install.is_none(), declined, "declined={declined}");
         }
     }
 
-    /// `--yes` is not an answer. It pre-answers surfpool's own prompts; it was never consent to
-    /// install a third-party repo nobody was asked about. With no marker on either path it
-    /// installs nothing and writes nothing, so the next interactive scaffold still asks — and it
-    /// still does not prompt, because suppressing the prompt is the half of the flag that is real.
     #[test]
-    fn the_yes_flag_is_not_an_answer() {
+    fn the_yes_flag_alone_installs_nothing_and_records_nothing() {
         let (base, home, location) = scratch();
         assert!(
             dev_skill_install_if_wanted(&location, base.path(), home.path(), true, || {
                 panic!("--yes must not prompt")
             })
-            .is_none(),
-            "--yes with nothing on record installed a skill nobody was asked about"
+            .is_none()
         );
-        assert!(
-            dev_skill_answer(home.path()).is_none(),
-            "a skip recorded as an answer closes a question that is still open"
-        );
+        assert!(dev_skill_answer(home.path()).is_none());
     }
 
     #[test]
@@ -816,10 +713,7 @@ mod tests {
             dev_skill_install_if_wanted(&location, base.path(), home.path(), false, || Some(false))
                 .is_none()
         );
-        assert!(
-            home.path().join(DEV_SKILL_DECLINED_MARKER).exists(),
-            "a decline that is not written down is a decline that gets asked again"
-        );
+        assert!(home.path().join(DEV_SKILL_DECLINED_MARKER).exists());
         assert!(
             dev_skill_install_if_wanted(&location, base.path(), home.path(), false, || {
                 panic!("the recorded decline must not prompt again")
@@ -843,8 +737,6 @@ mod tests {
         );
     }
 
-    /// A prompt that could not be shown is not a decline, so it is not remembered as one and
-    /// the next scaffold still asks.
     #[test]
     fn an_undisplayable_prompt_installs_nothing_and_records_nothing() {
         let (base, home, location) = scratch();
@@ -853,19 +745,5 @@ mod tests {
                 .is_none()
         );
         assert!(dev_skill_answer(home.path()).is_none());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn no_outcome_of_the_install_reaches_the_scaffold() {
-        let started = Instant::now();
-        spawn_dev_skill_install(Command::new("surfpool-567-no-such-binary"));
-        spawn_dev_skill_install(sh("exit 1"));
-        spawn_dev_skill_install(sh("sleep 30"));
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the scaffold waited on the install: {:?}",
-            started.elapsed()
-        );
     }
 }

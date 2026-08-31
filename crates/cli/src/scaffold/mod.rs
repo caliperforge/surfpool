@@ -153,7 +153,6 @@ const DEV_SKILL_DECLINED_MARKER: &str = ".config/surfpool/dev-skill-declined";
 
 const DEV_SKILL_ACCEPTED_MARKER: &str = ".config/surfpool/dev-skill-accepted";
 
-/// Returns the command that installs the solana-dev skill into `base_location`.
 fn dev_skill_install_command(base_location: &FileLocation) -> Command {
     let mut command = Command::new("npx");
     command.args([
@@ -222,7 +221,6 @@ fn record_dev_skill_answer(home: &Path, consented: bool) {
     let _ = File::create(marker);
 }
 
-/// Returns the command to install the solana-dev skill, or `None` if it should not be installed.
 fn dev_skill_install_if_wanted(
     base_location: &FileLocation,
     base: &Path,
@@ -686,7 +684,6 @@ mod tests {
         }
     }
 
-    /// A recorded answer is used even under `--yes`, and is never re-prompted.
     #[test]
     fn the_yes_flag_uses_the_recorded_answer() {
         for declined in [true, false] {

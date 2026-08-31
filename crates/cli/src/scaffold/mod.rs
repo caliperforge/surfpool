@@ -709,6 +709,17 @@ mod tests {
         // "*" is the installer's own alias for every agent it knows, so naming one
         // agent and naming all of them are one typo apart.
         assert_ne!(DEV_SKILL_AGENT, "*");
+        // The arg-vector assert above spells DEV_SKILL_INSTALLER on both sides, so it moves with
+        // the const and cannot see the value change. This is the only assertion on the pin itself.
+        let (_, version) = DEV_SKILL_INSTALLER
+            .split_once('@')
+            .expect("installer is pinned");
+        let exact = version.split('.').count() == 3
+            && version.bytes().all(|b| b.is_ascii_digit() || b == b'.');
+        assert!(
+            exact,
+            "the installer must be pinned to an exact version, not a range: {version}"
+        );
     }
 
     /// `surfpool start -m ../elsewhere/txtx.yml` scaffolds a tree the caller is not standing in,

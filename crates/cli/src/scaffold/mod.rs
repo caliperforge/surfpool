@@ -227,8 +227,11 @@ fn record_dev_skill_answer(home: &Path, consented: bool) {
     let _ = File::create(marker);
 }
 
-/// A recorded answer and an install on disk both outrank `--yes`. Paths are arguments so the
-/// gate is testable without a real home directory.
+/// Only a recorded answer, or an install already on disk, decides this; `--yes` decides nothing
+/// and alone never installs. It pre-answers surfpool's own prompts, and nobody has been asked
+/// about a third-party repo whose contents we do not pin. What it still does is suppress the
+/// prompt, so a non-interactive run skips rather than blocks. Paths are arguments so the gate is
+/// testable without a real home directory.
 fn dev_skill_install_if_wanted(
     base_location: &FileLocation,
     base: &Path,
@@ -241,7 +244,17 @@ fn dev_skill_install_if_wanted(
     }
     let consented = match dev_skill_answer(home) {
         Some(recorded) => recorded,
-        None if auto_accept => true,
+        // An absent answer is not a yes, and a silent skip is the same invisible install by
+        // another name, so say it and name the run that does ask. Nothing is recorded: the
+        // question is still open.
+        None if auto_accept => {
+            println!(
+                "{} {} (run `surfpool start` without --yes to be asked)",
+                green!("Skipped the installer for"),
+                DEV_SKILL_DIR
+            );
+            false
+        }
         None => match ask() {
             Some(answer) => {
                 record_dev_skill_answer(home, answer);
@@ -662,9 +675,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        DEV_SKILL_AGENT, DEV_SKILL_DECLINED_MARKER, DEV_SKILL_DIR, DEV_SKILL_INSTALLER,
-        DEV_SKILL_REPO, FileLocation, dev_skill_answer, dev_skill_install_command,
-        dev_skill_install_if_wanted, spawn_dev_skill_install,
+        DEV_SKILL_ACCEPTED_MARKER, DEV_SKILL_AGENT, DEV_SKILL_DECLINED_MARKER, DEV_SKILL_DIR,
+        DEV_SKILL_INSTALLER, DEV_SKILL_REPO, FileLocation, dev_skill_answer,
+        dev_skill_install_command, dev_skill_install_if_wanted, spawn_dev_skill_install,
     };
 
     /// Every gate test runs against these, never a real home directory.
@@ -751,18 +764,19 @@ mod tests {
         }
     }
 
-    /// Under `--yes`, the marker decides. The remembered no is read before the flag rather
-    /// than after, or a CI machine relitigates it hourly; absent one, `--yes` is the
-    /// codebase's existing "answered in advance". Neither case may reach the prompt.
+    /// Under `--yes`, the marker decides and only the marker does. The remembered answer is read
+    /// before the flag rather than after, so a CI machine neither relitigates a no hourly nor
+    /// re-asks a user who already said yes. Neither case may reach the prompt.
     #[test]
     fn under_the_yes_flag_the_marker_decides() {
         for declined in [true, false] {
             let (base, home, location) = scratch();
-            if declined {
-                let marker = home.path().join(DEV_SKILL_DECLINED_MARKER);
-                fs::create_dir_all(marker.parent().unwrap()).unwrap();
-                File::create(&marker).unwrap();
-            }
+            let marker = home.path().join(match declined {
+                true => DEV_SKILL_DECLINED_MARKER,
+                false => DEV_SKILL_ACCEPTED_MARKER,
+            });
+            fs::create_dir_all(marker.parent().unwrap()).unwrap();
+            File::create(&marker).unwrap();
             let install =
                 dev_skill_install_if_wanted(&location, base.path(), home.path(), true, || {
                     panic!("--yes must not prompt")
@@ -773,6 +787,26 @@ mod tests {
                 "--yes with a recorded decline={declined} decided the wrong way"
             );
         }
+    }
+
+    /// `--yes` is not an answer. It pre-answers surfpool's own prompts; it was never consent to
+    /// install a third-party repo nobody was asked about. With no marker on either path it
+    /// installs nothing and writes nothing, so the next interactive scaffold still asks — and it
+    /// still does not prompt, because suppressing the prompt is the half of the flag that is real.
+    #[test]
+    fn the_yes_flag_is_not_an_answer() {
+        let (base, home, location) = scratch();
+        assert!(
+            dev_skill_install_if_wanted(&location, base.path(), home.path(), true, || {
+                panic!("--yes must not prompt")
+            })
+            .is_none(),
+            "--yes with nothing on record installed a skill nobody was asked about"
+        );
+        assert!(
+            dev_skill_answer(home.path()).is_none(),
+            "a skip recorded as an answer closes a question that is still open"
+        );
     }
 
     #[test]

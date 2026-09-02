@@ -28,8 +28,8 @@ use super::{
 use crate::{
     runbook::{execute_in_memory_runbook, execute_on_disk_runbook},
     scaffold::{
-        ProgramFrameworkData, detect_program_frameworks, scaffold_iac_layout,
-        scaffold_in_memory_iac,
+        DevSkillInstall, DevSkillInstallOutcome, ProgramFrameworkData, detect_program_frameworks,
+        scaffold_iac_layout, scaffold_in_memory_iac,
     },
 };
 
@@ -202,6 +202,7 @@ struct StartupPlan {
     on_disk_runbook_data: Option<(FileLocation, Vec<String>)>,
     in_memory_runbook_data: Option<(String, RunbookSources, WorkspaceManifest)>,
     runbook_input: Vec<String>,
+    dev_skill_install: Option<DevSkillInstall>,
 }
 
 /// Inspects the project, scaffolds runbooks as the execution mode requires,
@@ -222,6 +223,7 @@ async fn plan_startup(
     let mut on_disk_runbook_data = None;
     let mut in_memory_runbook_data = None;
     let mut clone_pubkeys = vec![];
+    let mut dev_skill_install = None;
     let runbook_input = cmd.project.runbook_input.clone();
 
     let mode = RunbookExecutionMode::from_inputs(
@@ -280,7 +282,7 @@ async fn plan_startup(
 
         match mode {
             RunbookExecutionMode::ScaffoldOnDisk => {
-                scaffold_iac_layout(
+                dev_skill_install = scaffold_iac_layout(
                     &framework,
                     &programs,
                     &base_location,
@@ -328,6 +330,7 @@ async fn plan_startup(
         on_disk_runbook_data,
         in_memory_runbook_data,
         runbook_input,
+        dev_skill_install,
     })
 }
 
@@ -351,6 +354,7 @@ pub(super) async fn plan_and_dispatch_startup(
         on_disk_runbook_data,
         in_memory_runbook_data,
         runbook_input,
+        dev_skill_install,
     } = plan_startup(cmd, simnet_events_tx)
         .await
         .map_err(StartupPlanFailure::Planning)?;
@@ -430,6 +434,12 @@ pub(super) async fn plan_and_dispatch_startup(
         }
     }
 
+    if let Some(install) = dev_skill_install {
+        let events_tx = simnet_events_tx.clone();
+        let _ = hiro_system_kit::thread_named("Dev Skill Install Report")
+            .spawn(move || report_dev_skill_install(install.outcome(), &events_tx));
+    }
+
     if cmd.project.watch {
         // The watcher is a dev convenience; the startup tasks are
         // already dispatched and may legitimately reach Ready, so a watcher
@@ -450,6 +460,15 @@ pub(super) async fn plan_and_dispatch_startup(
     }
 
     Ok(progress_rx)
+}
+
+fn report_dev_skill_install(outcome: DevSkillInstallOutcome, events_tx: &SimnetEventsTx) {
+    match outcome {
+        DevSkillInstallOutcome::Installed => events_tx.info("The Solana dev skill was installed"),
+        DevSkillInstallOutcome::Failed(reason) => {
+            events_tx.warn(format!("The Solana dev skill was not installed: {reason}"));
+        }
+    }
 }
 
 /// Watches the deploy-artifacts directory and re-executes the startup
@@ -594,7 +613,9 @@ fn assemble_runbook_execution_futures(
 
 #[cfg(test)]
 mod tests {
-    use super::RunbookExecutionMode;
+    use surfpool_types::{SimnetEvent, SimnetEventsTx};
+
+    use super::{DevSkillInstallOutcome, RunbookExecutionMode, report_dev_skill_install};
 
     /// A project that already has a `txtx.yml` executes it as written. Framework
     /// detection contributes clone addresses on that path, but nothing the
@@ -641,6 +662,28 @@ mod tests {
                 mode.requires_framework_detection(),
                 "{mode:?} has no runbook without detection"
             );
+        }
+    }
+
+    #[test]
+    fn both_install_outcomes_reach_the_user() {
+        let (events_tx, events_rx) = SimnetEventsTx::unbounded();
+
+        let success = "The Solana dev skill was installed";
+        report_dev_skill_install(DevSkillInstallOutcome::Installed, &events_tx);
+        match events_rx.try_recv() {
+            Ok(SimnetEvent::InfoLog(_, message)) => assert!(message.contains(success), "{message}"),
+            other => panic!("a successful install was not reported: {other:?}"),
+        }
+
+        let failure = "installer exited with status 1: YAML parse error";
+        report_dev_skill_install(
+            DevSkillInstallOutcome::Failed(failure.to_string()),
+            &events_tx,
+        );
+        match events_rx.try_recv() {
+            Ok(SimnetEvent::WarnLog(_, message)) => assert!(message.contains(failure), "{message}"),
+            other => panic!("a failed install was not reported: {other:?}"),
         }
     }
 

@@ -2,7 +2,7 @@ use std::{
     env,
     fs::{self, File},
     path::Path,
-    process::{Command, Stdio},
+    process::{Child, Command, Output, Stdio},
 };
 
 use dialoguer::{Confirm, Input, MultiSelect, console::Style, theme::ColorfulTheme};
@@ -143,8 +143,7 @@ const DEV_SKILL_REPO: &str = "https://github.com/solana-foundation/solana-dev-sk
 
 const DEV_SKILL_INSTALLER: &str = "skills@1.5.23";
 
-/// Installs only the canonical `.agents/skills` copy. Without it, the installer also writes
-/// `.claude/`, `agent/` and a lock file for every agent it knows about.
+/// Anything else also writes `.claude/`, `agent/` and per-agent lock files.
 const DEV_SKILL_AGENT: &str = "universal";
 
 const DEV_SKILL_DIR: &str = ".agents/skills/solana-dev";
@@ -170,19 +169,52 @@ fn dev_skill_install_command(base_location: &FileLocation) -> Command {
     command
 }
 
-/// Runs the install in the background, discarding its output and exit status.
-fn spawn_dev_skill_install(mut command: Command) {
-    let Ok(mut child) = command
+#[derive(Debug)]
+pub enum DevSkillInstallOutcome {
+    Installed,
+    /// Carries the installer's own output.
+    Failed(String),
+}
+
+/// The holder is responsible for reporting the outcome.
+#[must_use]
+pub struct DevSkillInstall(Child);
+
+impl DevSkillInstall {
+    /// Blocks until the install finishes.
+    pub fn outcome(self) -> DevSkillInstallOutcome {
+        match self.0.wait_with_output() {
+            Ok(output) if output.status.success() => DevSkillInstallOutcome::Installed,
+            Ok(output) => DevSkillInstallOutcome::Failed(installer_failure(&output)),
+            Err(e) => DevSkillInstallOutcome::Failed(e.to_string()),
+        }
+    }
+}
+
+/// Errs only when the installer could not be started at all.
+fn spawn_dev_skill_install(mut command: Command) -> Result<DevSkillInstall, String> {
+    command
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
-    else {
-        return;
+        .map(DevSkillInstall)
+        .map_err(|e| e.to_string())
+}
+
+fn installer_failure(output: &Output) -> String {
+    let mut reason = match output.status.code() {
+        Some(code) => format!("installer exited with status {code}"),
+        None => "installer was terminated".to_string(),
     };
-    let _ = hiro_system_kit::thread_named("Dev Skill Install").spawn(move || {
-        let _ = child.wait();
-    });
+    let mut details = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if details.is_empty() {
+        details = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    }
+    if !details.is_empty() {
+        reason = format!("{reason}: {details}");
+    }
+    reason
 }
 
 fn dev_skill_installed(base: &Path, home: &Path) -> bool {
@@ -221,7 +253,6 @@ fn record_dev_skill_answer(home: &Path, consented: bool) {
     let _ = File::create(marker);
 }
 
-/// Returns the command to install the solana-dev skill, or `None` if it should not be installed.
 fn dev_skill_install_if_wanted(
     base_location: &FileLocation,
     base: &Path,
@@ -317,7 +348,7 @@ pub fn scaffold_iac_layout(
     programs: &[ProgramMetadata],
     base_location: &FileLocation,
     auto_generate_runbooks: bool,
-) -> Result<(), String> {
+) -> Result<Option<DevSkillInstall>, String> {
     let mut target_location = base_location.clone();
     target_location.append_path("target")?;
 
@@ -540,7 +571,7 @@ pub fn scaffold_iac_layout(
             //     "file {} already exists. choose a different runbook name, or rename the existing file",
             //     runbook_file_location.to_string()
             // ))
-            return Ok(());
+            return Ok(None);
         }
         false => {
             // write main.tx
@@ -626,18 +657,36 @@ pub fn scaffold_iac_layout(
 
     let home = get_home_dir();
     let base = base_location.expect_path_buf();
-    if let Some(command) = dev_skill_install_if_wanted(
+    let dev_skill_install = match dev_skill_install_if_wanted(
         base_location,
         &base,
         Path::new(&home),
         auto_generate_runbooks,
         || prompt_for_dev_skill(&theme),
     ) {
-        spawn_dev_skill_install(command);
-        println!("{} {}", green!("Started installer for"), DEV_SKILL_DIR);
-    }
+        Some(command) => match spawn_dev_skill_install(command) {
+            Ok(install) => {
+                println!(
+                    "{} {}",
+                    green!("Installing in the background"),
+                    DEV_SKILL_DIR
+                );
+                Some(install)
+            }
+            Err(e) => {
+                println!(
+                    "{} {}: {}",
+                    red!("Could not start the installer for"),
+                    DEV_SKILL_DIR,
+                    e
+                );
+                None
+            }
+        },
+        None => None,
+    };
 
-    Ok(())
+    Ok(dev_skill_install)
 }
 
 #[cfg(test)]
@@ -645,14 +694,14 @@ mod tests {
     use std::{
         fs::{self, File},
         process::Command,
-        time::{Duration, Instant},
     };
 
     use tempfile::TempDir;
 
     use super::{
-        DEV_SKILL_ACCEPTED_MARKER, DEV_SKILL_DECLINED_MARKER, DEV_SKILL_DIR, FileLocation,
-        dev_skill_answer, dev_skill_install_if_wanted, spawn_dev_skill_install,
+        DEV_SKILL_ACCEPTED_MARKER, DEV_SKILL_DECLINED_MARKER, DEV_SKILL_DIR,
+        DevSkillInstallOutcome, FileLocation, dev_skill_answer, dev_skill_install_if_wanted,
+        spawn_dev_skill_install,
     };
 
     fn scratch() -> (TempDir, TempDir, FileLocation) {
@@ -756,18 +805,31 @@ mod tests {
         assert!(dev_skill_answer(home.path()).is_none());
     }
 
-    /// An install that is missing, fails, or hangs does not delay the scaffold.
     #[cfg(unix)]
     #[test]
-    fn no_outcome_of_the_install_reaches_the_scaffold() {
-        let started = Instant::now();
-        spawn_dev_skill_install(Command::new("surfpool-567-no-such-binary"));
-        spawn_dev_skill_install(sh("exit 1"));
-        spawn_dev_skill_install(sh("sleep 30"));
+    fn failed_install_reports_the_error() {
+        for script in [
+            "echo 'YAML parse error' >&2; exit 1",
+            "echo 'YAML parse error'; exit 1",
+        ] {
+            let install = spawn_dev_skill_install(sh(script)).expect("the installer started");
+            match install.outcome() {
+                DevSkillInstallOutcome::Failed(reason) => {
+                    assert_eq!(reason, "installer exited with status 1: YAML parse error");
+                }
+                DevSkillInstallOutcome::Installed => panic!("{script}: reported success"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_install_reports_installed() {
+        let install = spawn_dev_skill_install(sh("echo 'copied 34 files'; exit 0"))
+            .expect("the installer started");
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the scaffold waited on the install: {:?}",
-            started.elapsed()
+            matches!(install.outcome(), DevSkillInstallOutcome::Installed),
+            "a clean install was reported as a failure"
         );
     }
 }

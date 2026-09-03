@@ -164,6 +164,7 @@ fn dev_skill_install_command(base_location: &FileLocation) -> Command {
         "--agent",
         DEV_SKILL_AGENT,
         "-y",
+        "--global",
     ]);
     command.current_dir(base_location.expect_path_buf());
     command

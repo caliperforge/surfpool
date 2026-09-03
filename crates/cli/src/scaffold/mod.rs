@@ -237,7 +237,7 @@ fn prompt_for_dev_skill(theme: &ColorfulTheme) -> Option<bool> {
         .with_prompt(format!(
             "Install the solana-dev skill? This will write to the {DEV_SKILL_DIR} directory."
         ))
-        .default(false)
+        .default(true)
         .interact()
         .ok()
 }

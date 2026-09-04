@@ -247,7 +247,11 @@ impl Middleware<Option<RunloopContext>> for SurfpoolMiddleware {
         });
 
         let Request::Single(Call::MethodCall(ref method_call)) = request else {
-            if let Request::Batch(calls) = request {
+            // JSON-RPC 2.0 §6: an empty array is not a batch and answers with one Invalid
+            // Request object, which is what the arm below already returns.
+            if let Request::Batch(calls) = request
+                && !calls.is_empty()
+            {
                 return self.dispatch_batch(calls, meta, next);
             }
 
@@ -519,6 +523,19 @@ mod tests {
                     "message": "Cheatcode rpc method: surfnet_setAccount is currently disabled"
                 }, "id": 2}
             ])
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_batch_is_answered_with_one_invalid_request() {
+        let response = test_handler().handle_request("[]", None).await.unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap(),
+            json!({
+                "error": {"code": -32600, "message": "Only method calls are supported"},
+                "id": null
+            })
         );
     }
 }

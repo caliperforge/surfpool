@@ -1,4 +1,4 @@
-use std::{collections::HashSet, vec};
+use std::{collections::HashSet, str::FromStr, vec};
 
 use agave_reserved_account_keys::ReservedAccountKeys;
 use base64::{Engine, prelude::BASE64_STANDARD};
@@ -51,15 +51,17 @@ use solana_zk_sdk_pod::encryption::{
 use spl_token_2022_interface::extension::{
     BaseStateWithExtensions, BaseStateWithExtensionsMut, ExtensionType, StateWithExtensions,
     StateWithExtensionsMut,
-    confidential_transfer::{ConfidentialTransferAccount, PENDING_BALANCE_LO_BIT_LENGTH},
+    confidential_transfer::{
+        ConfidentialTransferAccount, ConfidentialTransferMint, PENDING_BALANCE_LO_BIT_LENGTH,
+    },
     confidential_transfer_fee::ConfidentialTransferFeeAmount,
     interest_bearing_mint::InterestBearingConfig,
     scaled_ui_amount::ScaledUiAmountConfig,
     transfer_fee::TransferFeeConfig,
 };
 use surfpool_types::types::{
-    ConfidentialBalanceKeys, ConfidentialTransferAccountUpdate, DeriveConfidentialKeysResponse,
-    GetConfidentialBalanceResponse,
+    ConfidentialBalanceKeys, ConfidentialTransferAccountUpdate, ConfidentialTransferMintUpdate,
+    DeriveConfidentialKeysResponse, GetConfidentialBalanceResponse,
 };
 use txtx_addon_kit::indexmap::IndexMap;
 
@@ -1444,6 +1446,118 @@ pub fn build_confidential_token_account_data(
     Ok(buffer)
 }
 
+/// Build the raw account data for a Token-2022 mint that carries the
+/// confidential-transfer mint extension.
+///
+/// Test-only helper backing the `surfnet_setMint` cheatcode: it writes the
+/// extension directly, bypassing the on-chain
+/// `ConfidentialTransferInitializeMint`. An absent `authority` or
+/// `auditor_elgamal_pubkey` is written as the extension's null value.
+pub fn build_confidential_mint_data(
+    base: &spl_token_2022_interface::state::Mint,
+    conf: &ConfidentialTransferMintUpdate,
+) -> Result<Vec<u8>, String> {
+    let authority = conf
+        .authority
+        .as_deref()
+        .map(Pubkey::from_str)
+        .transpose()
+        .map_err(|e| format!("authority: {e}"))?;
+
+    let auditor_elgamal_pubkey = conf
+        .auditor_elgamal_pubkey
+        .as_deref()
+        .map(|key| {
+            let bytes = decode_confidential_key(key, 32)
+                .map_err(|e| format!("auditorElgamalPubkey: {e}"))?;
+            ElGamalPubkey::try_from(bytes.as_slice())
+                .map_err(|e| format!("auditorElgamalPubkey: invalid ElGamal public key ({e})"))
+        })
+        .transpose()?;
+
+    let extension_types = [ExtensionType::ConfidentialTransferMint];
+    let mint_len = ExtensionType::try_calculate_account_len::<
+        spl_token_2022_interface::state::Mint,
+    >(&extension_types)
+    .map_err(|e| format!("failed to size confidential mint: {e}"))?;
+
+    let mut buffer = vec![0u8; mint_len];
+    let mut state =
+        StateWithExtensionsMut::<spl_token_2022_interface::state::Mint>::unpack_uninitialized(
+            &mut buffer,
+        )
+        .map_err(|e| format!("failed to init confidential mint buffer: {e}"))?;
+
+    state.base = *base;
+    state.pack_base();
+    state
+        .init_account_type()
+        .map_err(|e| format!("failed to set account type: {e}"))?;
+
+    {
+        let ct = state
+            .init_extension::<ConfidentialTransferMint>(false)
+            .map_err(|e| format!("failed to init confidential mint extension: {e}"))?;
+        ct.authority = authority.map(Into::into).unwrap_or_default();
+        ct.auto_approve_new_accounts = conf.auto_approve_new_accounts.unwrap_or(true).into();
+        ct.auditor_elgamal_pubkey = auditor_elgamal_pubkey
+            .map(|key| PodElGamalPubkey::from(key).into())
+            .unwrap_or_default();
+    }
+
+    drop(state);
+    Ok(buffer)
+}
+
+#[cfg(test)]
+mod confidential_mint_tests {
+    use solana_zk_sdk::encryption::elgamal::ElGamalKeypair;
+
+    use super::*;
+
+    /// The auditor key has to be real ElGamal material: a well-formed 32-byte
+    /// string that is not a curve point is refused just like a short one, so a
+    /// mint never ships an auditor key no client can encrypt to.
+    #[test]
+    fn an_auditor_key_that_is_not_elgamal_material_is_refused() {
+        let base = spl_token_2022_interface::state::Mint {
+            is_initialized: true,
+            ..Default::default()
+        };
+
+        for auditor in [
+            bs58::encode([7u8; 16]).into_string(),
+            bs58::encode([0xffu8; 32]).into_string(),
+        ] {
+            let error = build_confidential_mint_data(
+                &base,
+                &ConfidentialTransferMintUpdate {
+                    auditor_elgamal_pubkey: Some(auditor),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            assert!(error.starts_with("auditorElgamalPubkey:"), "got: {error}");
+        }
+
+        let auditor = ElGamalKeypair::new_rand();
+        assert!(
+            build_confidential_mint_data(
+                &base,
+                &ConfidentialTransferMintUpdate {
+                    auditor_elgamal_pubkey: Some(
+                        bs58::encode(bytes_of(&PodElGamalPubkey::from(auditor.pubkey_owned())))
+                            .into_string()
+                    ),
+                    ..Default::default()
+                },
+            )
+            .is_ok(),
+            "a real ElGamal pubkey is accepted"
+        );
+    }
+}
+
 /// Decrypt the confidential balances held on a Token-2022 token account.
 ///
 /// Backs the `surfnet_getConfidentialBalance` cheatcode, the read half of the
@@ -1692,11 +1806,75 @@ impl MintAccount {
         }
     }
 
+    pub fn new(token_program_id: &Pubkey) -> Self {
+        if token_program_id == &spl_token_2022_interface::id() {
+            Self::SplToken2022(spl_token_2022_interface::state::Mint {
+                is_initialized: true,
+                ..Default::default()
+            })
+        } else {
+            Self::SplToken(spl_token_interface::state::Mint {
+                is_initialized: true,
+                ..Default::default()
+            })
+        }
+    }
+
     pub fn decimals(&self) -> u8 {
         match self {
             Self::SplToken2022(mint) => mint.decimals,
             Self::SplToken(mint) => mint.decimals,
         }
+    }
+
+    pub fn set_decimals(&mut self, decimals: u8) {
+        match self {
+            Self::SplToken2022(mint) => mint.decimals = decimals,
+            Self::SplToken(mint) => mint.decimals = decimals,
+        }
+    }
+
+    pub fn set_supply(&mut self, supply: u64) {
+        match self {
+            Self::SplToken2022(mint) => mint.supply = supply,
+            Self::SplToken(mint) => mint.supply = supply,
+        }
+    }
+
+    pub fn set_mint_authority(&mut self, mint_authority: COption<Pubkey>) {
+        match self {
+            Self::SplToken2022(mint) => mint.mint_authority = mint_authority,
+            Self::SplToken(mint) => mint.mint_authority = mint_authority,
+        }
+    }
+
+    pub fn pack_into_vec(&self) -> Vec<u8> {
+        match self {
+            Self::SplToken2022(mint) => {
+                let mut dst = [0u8; spl_token_2022_interface::state::Mint::LEN];
+                mint.pack_into_slice(&mut dst);
+                dst.to_vec()
+            }
+            Self::SplToken(mint) => {
+                let mut dst = [0u8; spl_token_interface::state::Mint::LEN];
+                mint.pack_into_slice(&mut dst);
+                dst.to_vec()
+            }
+        }
+    }
+
+    pub fn pack_into_preserving_extensions(&self, original: &[u8]) -> SurfpoolResult<Vec<u8>> {
+        let base_len = spl_token_interface::state::Mint::LEN;
+        if original.len() < base_len {
+            return Err(SurfpoolError::unpack_mint_account());
+        }
+
+        let mut data = original.to_vec();
+        match self {
+            Self::SplToken2022(mint) => mint.pack_into_slice(&mut data[..base_len]),
+            Self::SplToken(mint) => mint.pack_into_slice(&mut data[..base_len]),
+        }
+        Ok(data)
     }
 }
 

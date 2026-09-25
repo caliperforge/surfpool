@@ -1,4 +1,4 @@
-use std::{collections::HashSet, vec};
+use std::{collections::HashSet, str::FromStr, vec};
 
 use agave_reserved_account_keys::ReservedAccountKeys;
 use base64::{Engine, prelude::BASE64_STANDARD};
@@ -49,17 +49,19 @@ use solana_zk_sdk_pod::encryption::{
     elgamal::{PodElGamalCiphertext, PodElGamalPubkey},
 };
 use spl_token_2022_interface::extension::{
-    BaseStateWithExtensions, BaseStateWithExtensionsMut, ExtensionType, StateWithExtensions,
-    StateWithExtensionsMut,
-    confidential_transfer::{ConfidentialTransferAccount, PENDING_BALANCE_LO_BIT_LENGTH},
+    AccountType, BaseStateWithExtensions, BaseStateWithExtensionsMut, ExtensionType,
+    StateWithExtensions, StateWithExtensionsMut,
+    confidential_transfer::{
+        ConfidentialTransferAccount, ConfidentialTransferMint, PENDING_BALANCE_LO_BIT_LENGTH,
+    },
     confidential_transfer_fee::ConfidentialTransferFeeAmount,
     interest_bearing_mint::InterestBearingConfig,
     scaled_ui_amount::ScaledUiAmountConfig,
     transfer_fee::TransferFeeConfig,
 };
 use surfpool_types::types::{
-    ConfidentialBalanceKeys, ConfidentialTransferAccountUpdate, DeriveConfidentialKeysResponse,
-    GetConfidentialBalanceResponse,
+    ConfidentialBalanceKeys, ConfidentialTransferAccountUpdate, ConfidentialTransferMintUpdate,
+    DeriveConfidentialKeysResponse, GetConfidentialBalanceResponse,
 };
 use txtx_addon_kit::indexmap::IndexMap;
 
@@ -1444,6 +1446,179 @@ pub fn build_confidential_token_account_data(
     Ok(buffer)
 }
 
+/// Add or update the confidential-transfer extension on `original`, a Token-2022
+/// mint, with `base` as its base state and every other extension kept.
+///
+/// Backs the `surfnet_setMint` cheatcode. Fields `conf` leaves out keep their
+/// current value (on a new extension: null, and `auto_approve_new_accounts`
+/// true); an explicit null clears `authority` or `auditor_elgamal_pubkey`.
+pub fn build_confidential_mint_data(
+    original: &[u8],
+    base: &spl_token_2022_interface::state::Mint,
+    conf: &ConfidentialTransferMintUpdate,
+) -> Result<Vec<u8>, String> {
+    let authority = conf
+        .authority
+        .as_ref()
+        .map(|authority| authority.as_deref().map(Pubkey::from_str).transpose())
+        .transpose()
+        .map_err(|e| format!("authority: {e}"))?;
+
+    let auditor_elgamal_pubkey = conf
+        .auditor_elgamal_pubkey
+        .as_ref()
+        .map(|key| {
+            key.as_deref()
+                .map(decode_auditor_elgamal_pubkey)
+                .transpose()
+        })
+        .transpose()?;
+
+    let current = StateWithExtensions::<spl_token_2022_interface::state::Mint>::unpack(original)
+        .map_err(|e| format!("failed to read mint: {e}"))?;
+    let has_extension = current.get_extension::<ConfidentialTransferMint>().is_ok();
+    let mint_len = current
+        .try_get_new_account_len::<ConfidentialTransferMint>()
+        .map_err(|e| format!("failed to size confidential mint: {e}"))?
+        .max(original.len());
+
+    let mut buffer = original.to_vec();
+    buffer.resize(mint_len, 0);
+    // Mints are padded to the account length, so AccountType sits at byte 165 for both.
+    buffer[spl_token_2022_interface::state::Account::LEN] = AccountType::Mint as u8;
+    let mut state =
+        StateWithExtensionsMut::<spl_token_2022_interface::state::Mint>::unpack(&mut buffer)
+            .map_err(|e| format!("failed to unpack confidential mint buffer: {e}"))?;
+
+    state.base = *base;
+    state.pack_base();
+
+    let ct = if has_extension {
+        state.get_extension_mut::<ConfidentialTransferMint>()
+    } else {
+        state.init_extension::<ConfidentialTransferMint>(false)
+    }
+    .map_err(|e| format!("failed to init confidential mint extension: {e}"))?;
+    if let Some(authority) = authority {
+        ct.authority = authority.map(Into::into).unwrap_or_default();
+    }
+    if let Some(auditor) = auditor_elgamal_pubkey {
+        ct.auditor_elgamal_pubkey = auditor
+            .map(|key| PodElGamalPubkey::from(key).into())
+            .unwrap_or_default();
+    }
+    if let Some(auto_approve) = conf
+        .auto_approve_new_accounts
+        .or((!has_extension).then_some(true))
+    {
+        ct.auto_approve_new_accounts = auto_approve.into();
+    }
+
+    Ok(buffer)
+}
+
+fn decode_auditor_elgamal_pubkey(key: &str) -> Result<ElGamalPubkey, String> {
+    let bytes =
+        decode_confidential_key(key, 32).map_err(|e| format!("auditorElgamalPubkey: {e}"))?;
+    ElGamalPubkey::try_from(bytes.as_slice())
+        .map_err(|e| format!("auditorElgamalPubkey: invalid ElGamal public key ({e})"))
+}
+
+#[cfg(test)]
+mod confidential_mint_tests {
+    use solana_zk_sdk::encryption::elgamal::ElGamalKeypair;
+    use spl_token_2022_interface::state::Mint;
+
+    use super::*;
+
+    /// The auditor key has to be real ElGamal material: a well-formed 32-byte
+    /// string that is not a curve point is refused just like a short one, so a
+    /// mint never ships an auditor key no client can encrypt to.
+    #[test]
+    fn an_auditor_key_that_is_not_elgamal_material_is_refused() {
+        let base = Mint {
+            is_initialized: true,
+            ..Default::default()
+        };
+        let mut original = vec![0u8; Mint::LEN];
+        base.pack_into_slice(&mut original);
+
+        for auditor in [
+            bs58::encode([7u8; 16]).into_string(),
+            bs58::encode([0xffu8; 32]).into_string(),
+        ] {
+            let error = build_confidential_mint_data(
+                &original,
+                &base,
+                &ConfidentialTransferMintUpdate {
+                    auditor_elgamal_pubkey: Some(Some(auditor)),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            assert!(error.starts_with("auditorElgamalPubkey:"), "got: {error}");
+        }
+
+        let auditor = ElGamalKeypair::new_rand();
+        assert!(
+            build_confidential_mint_data(
+                &original,
+                &base,
+                &ConfidentialTransferMintUpdate {
+                    auditor_elgamal_pubkey: Some(Some(
+                        bs58::encode(bytes_of(&PodElGamalPubkey::from(auditor.pubkey_owned())))
+                            .into_string()
+                    )),
+                    ..Default::default()
+                },
+            )
+            .is_ok(),
+            "a real ElGamal pubkey is accepted"
+        );
+    }
+
+    #[test]
+    fn the_extension_is_added_beside_an_existing_one() {
+        let mut original = vec![
+            0u8;
+            ExtensionType::try_calculate_account_len::<Mint>(&[
+                ExtensionType::TransferFeeConfig
+            ])
+            .unwrap()
+        ];
+        let mut state =
+            StateWithExtensionsMut::<Mint>::unpack_uninitialized(&mut original).unwrap();
+        state.base = Mint {
+            is_initialized: true,
+            ..Default::default()
+        };
+        state.pack_base();
+        state.init_account_type().unwrap();
+        state.init_extension::<TransferFeeConfig>(false).unwrap();
+
+        let data = build_confidential_mint_data(
+            &original,
+            &Mint {
+                decimals: 3,
+                is_initialized: true,
+                ..Default::default()
+            },
+            &ConfidentialTransferMintUpdate::default(),
+        )
+        .unwrap();
+
+        let state = StateWithExtensions::<Mint>::unpack(&data).unwrap();
+        assert_eq!(state.base.decimals, 3);
+        assert_eq!(
+            state.get_extension_types().unwrap(),
+            [
+                ExtensionType::TransferFeeConfig,
+                ExtensionType::ConfidentialTransferMint
+            ]
+        );
+    }
+}
+
 /// Decrypt the confidential balances held on a Token-2022 token account.
 ///
 /// Backs the `surfnet_getConfidentialBalance` cheatcode, the read half of the
@@ -1692,11 +1867,75 @@ impl MintAccount {
         }
     }
 
+    pub fn new(token_program_id: &Pubkey) -> Self {
+        if token_program_id == &spl_token_2022_interface::id() {
+            Self::SplToken2022(spl_token_2022_interface::state::Mint {
+                is_initialized: true,
+                ..Default::default()
+            })
+        } else {
+            Self::SplToken(spl_token_interface::state::Mint {
+                is_initialized: true,
+                ..Default::default()
+            })
+        }
+    }
+
     pub fn decimals(&self) -> u8 {
         match self {
             Self::SplToken2022(mint) => mint.decimals,
             Self::SplToken(mint) => mint.decimals,
         }
+    }
+
+    pub fn set_decimals(&mut self, decimals: u8) {
+        match self {
+            Self::SplToken2022(mint) => mint.decimals = decimals,
+            Self::SplToken(mint) => mint.decimals = decimals,
+        }
+    }
+
+    pub fn set_supply(&mut self, supply: u64) {
+        match self {
+            Self::SplToken2022(mint) => mint.supply = supply,
+            Self::SplToken(mint) => mint.supply = supply,
+        }
+    }
+
+    pub fn set_mint_authority(&mut self, mint_authority: COption<Pubkey>) {
+        match self {
+            Self::SplToken2022(mint) => mint.mint_authority = mint_authority,
+            Self::SplToken(mint) => mint.mint_authority = mint_authority,
+        }
+    }
+
+    pub fn pack_into_vec(&self) -> Vec<u8> {
+        match self {
+            Self::SplToken2022(mint) => {
+                let mut dst = [0u8; spl_token_2022_interface::state::Mint::LEN];
+                mint.pack_into_slice(&mut dst);
+                dst.to_vec()
+            }
+            Self::SplToken(mint) => {
+                let mut dst = [0u8; spl_token_interface::state::Mint::LEN];
+                mint.pack_into_slice(&mut dst);
+                dst.to_vec()
+            }
+        }
+    }
+
+    pub fn pack_into_preserving_extensions(&self, original: &[u8]) -> SurfpoolResult<Vec<u8>> {
+        let base_len = spl_token_interface::state::Mint::LEN;
+        if original.len() < base_len {
+            return Err(SurfpoolError::unpack_mint_account());
+        }
+
+        let mut data = original.to_vec();
+        match self {
+            Self::SplToken2022(mint) => mint.pack_into_slice(&mut data[..base_len]),
+            Self::SplToken(mint) => mint.pack_into_slice(&mut data[..base_len]),
+        }
+        Ok(data)
     }
 }
 

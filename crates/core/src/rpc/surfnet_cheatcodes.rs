@@ -22,8 +22,8 @@ use surfpool_types::{
     StreamAccountsEntry, UiKeyedProfileResult,
     types::{
         AccountUpdate, ConfidentialBalanceKeys, DeriveConfidentialKeysResponse,
-        GetConfidentialBalanceResponse, SetSomeAccount, SupplyUpdate, TokenAccountUpdate,
-        UuidOrSignature,
+        GetConfidentialBalanceResponse, MintUpdate, SetSomeAccount, SupplyUpdate,
+        TokenAccountUpdate, UuidOrSignature,
     },
 };
 
@@ -38,8 +38,9 @@ use crate::{
         AccountSource, GetAccountResult, locker::SvmAccessContext, svm::AccountUpdatePolicy,
     },
     types::{
-        TimeTravelConfig, TokenAccount, build_confidential_token_account_data,
-        decrypt_confidential_balances, derive_confidential_keys, mint_has_transfer_fee_config,
+        MintAccount, TimeTravelConfig, TokenAccount, build_confidential_mint_data,
+        build_confidential_token_account_data, decrypt_confidential_balances,
+        derive_confidential_keys, mint_has_transfer_fee_config,
     },
 };
 
@@ -137,6 +138,33 @@ impl TokenAccountUpdateExt for TokenAccountUpdate {
                     token_account.set_close_authority(COption::None);
                 }
             }
+        }
+        Ok(())
+    }
+}
+
+pub trait MintUpdateExt {
+    fn apply(self, mint: &mut MintAccount) -> Result<()>;
+}
+
+impl MintUpdateExt for MintUpdate {
+    /// Apply the update to the mint's base fields
+    fn apply(self, mint: &mut MintAccount) -> Result<()> {
+        if let Some(decimals) = self.decimals {
+            mint.set_decimals(decimals);
+        }
+        if let Some(mint_authority) = self.mint_authority {
+            match mint_authority {
+                SetSomeAccount::Account(pubkey) => {
+                    mint.set_mint_authority(COption::Some(verify_pubkey(&pubkey)?));
+                }
+                SetSomeAccount::NoAccount => {
+                    mint.set_mint_authority(COption::None);
+                }
+            }
+        }
+        if let Some(supply) = self.supply {
+            mint.set_supply(supply);
         }
         Ok(())
     }
@@ -371,6 +399,59 @@ pub trait SurfnetCheatcodes {
         owner: String,
         mint: String,
         update: TokenAccountUpdate,
+        token_program: Option<String>,
+    ) -> BoxFuture<Result<RpcResponse<()>>>;
+
+    /// A "cheat code" method for developers to set or update a token mint in Surfpool.
+    ///
+    /// The mint is created when it does not exist yet; fields left out keep their
+    /// current value.
+    ///
+    /// ## Parameters
+    /// - `mint`: The public key of the mint, as a base-58 encoded string.
+    /// - `update`: The `MintUpdate` struct containing the optional fields to update:
+    ///   - `decimals` (u8), `supply` (u64)
+    ///   - `mintAuthority`: a base58 pubkey, or the literal string "null" to clear it
+    ///   - `confidential`: writes the Token-2022 `ConfidentialTransferMint` extension
+    ///     (`authority`, `auditorElgamalPubkey`, `autoApproveNewAccounts`, default
+    ///     true), producing the confidential-capable mint `surfnet_setTokenAccount`'s
+    ///     `confidential` path needs. Requires the mint to be Token-2022. Fields
+    ///     left out keep their current value; `null` clears `authority` or
+    ///     `auditorElgamalPubkey`. The mint's other extensions are kept.
+    /// - `token_program`: Optional token program id, defaulting to an existing mint's
+    ///   owner, or to the SPL Token program for a new mint. A value that differs from
+    ///   the owner is refused.
+    ///
+    /// The account keeps its lamports, topped up to the rent-exempt minimum.
+    ///
+    /// ## Returns
+    /// A `RpcResponse<()>` indicating whether the mint update was successful.
+    ///
+    /// ### Example Request (a confidential mint with an auditor)
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "id": 1,
+    ///   "method": "surfnet_setMint",
+    ///   "params": [
+    ///     "mint_pubkey",
+    ///     { "decimals": 6, "confidential": {
+    ///         "authority": "authority_pubkey",
+    ///         "auditorElgamalPubkey": "<base58, 32 bytes>"
+    ///     } },
+    ///     "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+    ///   ]
+    /// }
+    /// ```
+    ///
+    /// # See Also
+    /// - `surfnet_setTokenAccount`, `surfnet_getConfidentialBalance`
+    #[rpc(meta, name = "surfnet_setMint")]
+    fn set_mint(
+        &self,
+        meta: Self::Metadata,
+        mint: String,
+        update: MintUpdate,
         token_program: Option<String>,
     ) -> BoxFuture<Result<RpcResponse<()>>>;
 
@@ -1881,6 +1962,124 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                 Ok(())
             })?;
             svm_locker.apply_account_update(token_account, AccountUpdatePolicy::Authoritative)?;
+
+            Ok(RpcResponse {
+                context: RpcResponseContext::new(slot),
+                value: (),
+            })
+        })
+    }
+
+    fn set_mint(
+        &self,
+        meta: Self::Metadata,
+        mint_str: String,
+        update: MintUpdate,
+        some_token_program_str: Option<String>,
+    ) -> BoxFuture<Result<RpcResponse<()>>> {
+        let mint = match verify_pubkey(&mint_str) {
+            Ok(res) => res,
+            Err(e) => return e.into(),
+        };
+
+        let requested_program = match some_token_program_str {
+            Some(token_program_str) => match verify_pubkey(&token_program_str) {
+                Ok(res) => Some(res),
+                Err(e) => return e.into(),
+            },
+            None => None,
+        };
+
+        let SurfnetRpcContext {
+            svm_locker,
+            remote_ctx,
+        } = match meta.get_rpc_context(CommitmentConfig::confirmed()) {
+            Ok(res) => res,
+            Err(e) => return e.into(),
+        };
+
+        Box::pin(async move {
+            let confidential = update.confidential.clone();
+
+            let SvmAccessContext {
+                slot,
+                inner: mut mint_account,
+                ..
+            } = svm_locker
+                .get_account(
+                    &remote_ctx,
+                    &mint,
+                    Some(Box::new(move |_| {
+                        let token_program_id =
+                            requested_program.unwrap_or_else(spl_token_interface::id);
+                        GetAccountResult::FoundAccount(
+                            mint,
+                            Account {
+                                lamports: 0,
+                                owner: token_program_id,
+                                executable: false,
+                                rent_epoch: 0,
+                                data: MintAccount::new(&token_program_id).pack_into_vec(),
+                            },
+                            AccountSource::Generated,
+                        )
+                    })),
+                )
+                .await?;
+
+            let mut mint_data = MintAccount::unpack(mint_account.expected_data())
+                .map_err(|e| Error::invalid_params(format!("Failed to unpack mint data: {}", e)))?;
+
+            update.apply(&mut mint_data)?;
+
+            let final_mint_bytes = if let Some(conf) = &confidential {
+                let base = match &mint_data {
+                    MintAccount::SplToken2022(base) => *base,
+                    MintAccount::SplToken(_) => {
+                        return Err(Error::invalid_params(
+                            "confidential transfer mints require the Token-2022 program"
+                                .to_string(),
+                        ));
+                    }
+                };
+                build_confidential_mint_data(mint_account.expected_data(), &base, conf)
+                    .map_err(Error::invalid_params)?
+            } else {
+                mint_data
+                    .pack_into_preserving_extensions(mint_account.expected_data())
+                    .map_err(|e| {
+                        Error::invalid_params(format!("Failed to pack mint data: {}", e))
+                    })?
+            };
+
+            let minimum_rent = svm_locker.with_svm_reader(|svm_reader| {
+                svm_reader
+                    .inner
+                    .minimum_balance_for_rent_exemption(final_mint_bytes.len())
+            });
+
+            mint_account.apply_update(|account| {
+                let owner = account.owner;
+                if owner != spl_token_interface::id() && owner != spl_token_2022_interface::id() {
+                    return Err(Error::invalid_params(format!(
+                        "mint {mint} is owned by {owner}, which is neither the SPL Token nor the Token-2022 program"
+                    )));
+                }
+                if requested_program.is_some_and(|program| program != owner) {
+                    return Err(Error::invalid_params(format!(
+                        "mint {mint} is owned by {owner}, not the requested tokenProgram"
+                    )));
+                }
+                if confidential.is_some() && owner != spl_token_2022_interface::id() {
+                    return Err(Error::invalid_params(format!(
+                        "confidential transfer mints require the Token-2022 program, but mint {mint} is owned by {owner}"
+                    )));
+                }
+                account.lamports = account.lamports.max(minimum_rent);
+                account.data = final_mint_bytes.clone();
+                Ok(())
+            })?;
+            svm_locker.apply_account_update(mint_account, AccountUpdatePolicy::Authoritative)?;
 
             Ok(RpcResponse {
                 context: RpcResponseContext::new(slot),
@@ -5587,6 +5786,800 @@ mod tests {
             "pending should be present when an elgamalSecretKey is supplied"
         );
         assert_eq!(result.pending_balance_credit_counter, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_mint_writes_confidential_transfer_extension() {
+        use bytemuck::bytes_of;
+        use solana_zk_sdk::encryption::elgamal::ElGamalKeypair;
+        use solana_zk_sdk_pod::encryption::elgamal::PodElGamalPubkey;
+        use spl_token_2022_interface::extension::{
+            BaseStateWithExtensions, StateWithExtensions,
+            confidential_transfer::ConfidentialTransferMint,
+        };
+        use surfpool_types::types::ConfidentialTransferMintUpdate;
+
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let mint = Keypair::new();
+        let authority = Keypair::new();
+        let auditor = PodElGamalPubkey::from(ElGamalKeypair::new_rand().pubkey_owned());
+
+        client
+            .rpc
+            .set_mint(
+                Some(client.context.clone()),
+                mint.pubkey().to_string(),
+                MintUpdate {
+                    decimals: Some(6),
+                    confidential: Some(ConfidentialTransferMintUpdate {
+                        authority: Some(Some(authority.pubkey().to_string())),
+                        auditor_elgamal_pubkey: Some(Some(
+                            bs58::encode(bytes_of(&auditor)).into_string(),
+                        )),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                Some(spl_token_2022_interface::id().to_string()),
+            )
+            .await
+            .expect("set_mint should succeed");
+
+        let account = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader
+                .inner
+                .get_account(&mint.pubkey())
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(account.owner, spl_token_2022_interface::id());
+
+        let state =
+            StateWithExtensions::<spl_token_2022_interface::state::Mint>::unpack(&account.data)
+                .expect("mint should unpack with extensions");
+        let ext = state
+            .get_extension::<ConfidentialTransferMint>()
+            .expect("confidential mint extension should be present");
+
+        assert_eq!(state.base.decimals, 6);
+        assert_eq!(bytes_of(&ext.authority), authority.pubkey().as_ref());
+        assert_eq!(bytes_of(&ext.auditor_elgamal_pubkey), bytes_of(&auditor));
+        assert!(
+            bool::from(ext.auto_approve_new_accounts),
+            "new accounts should be auto-approved by default"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_mint_confidential_requires_token_2022() {
+        use surfpool_types::types::ConfidentialTransferMintUpdate;
+
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+
+        for token_program in [None, Some(spl_token_interface::id().to_string())] {
+            let mint = Keypair::new();
+            let error = client
+                .rpc
+                .set_mint(
+                    Some(client.context.clone()),
+                    mint.pubkey().to_string(),
+                    MintUpdate {
+                        confidential: Some(ConfidentialTransferMintUpdate::default()),
+                        ..Default::default()
+                    },
+                    token_program,
+                )
+                .await
+                .expect_err("a confidential mint outside Token-2022 should be refused");
+            assert_eq!(error.code, jsonrpc_core::ErrorCode::InvalidParams);
+
+            assert!(
+                client
+                    .context
+                    .svm_locker
+                    .with_svm_reader(|svm_reader| svm_reader
+                        .inner
+                        .get_account(&mint.pubkey())
+                        .unwrap()
+                        .is_none()),
+                "the refused mint should not be written"
+            );
+        }
+
+        let legacy_mint = Keypair::new();
+        client
+            .rpc
+            .set_mint(
+                Some(client.context.clone()),
+                legacy_mint.pubkey().to_string(),
+                MintUpdate {
+                    decimals: Some(6),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("set_mint should succeed");
+
+        let error = client
+            .rpc
+            .set_mint(
+                Some(client.context.clone()),
+                legacy_mint.pubkey().to_string(),
+                MintUpdate {
+                    confidential: Some(ConfidentialTransferMintUpdate::default()),
+                    ..Default::default()
+                },
+                Some(spl_token_2022_interface::id().to_string()),
+            )
+            .await
+            .expect_err(
+                "a confidential write onto a mint owned by the SPL Token program should be refused",
+            );
+        assert_eq!(error.code, jsonrpc_core::ErrorCode::InvalidParams);
+
+        let account = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader
+                .inner
+                .get_account(&legacy_mint.pubkey())
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(account.owner, spl_token_interface::id());
+        assert_eq!(account.data.len(), Mint::LEN);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_mint_writes_plain_spl_token_mint() {
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let mint = Keypair::new();
+        let mint_authority = Keypair::new();
+
+        client
+            .rpc
+            .set_mint(
+                Some(client.context.clone()),
+                mint.pubkey().to_string(),
+                MintUpdate {
+                    decimals: Some(9),
+                    mint_authority: Some(SetSomeAccount::Account(
+                        mint_authority.pubkey().to_string(),
+                    )),
+                    supply: Some(1_000),
+                    confidential: None,
+                },
+                None,
+            )
+            .await
+            .expect("set_mint should succeed");
+
+        let account = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader
+                .inner
+                .get_account(&mint.pubkey())
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(account.owner, spl_token_interface::id());
+        assert_eq!(account.data.len(), Mint::LEN);
+
+        let (decimals, supply, authority) = match MintAccount::unpack(&account.data)
+            .expect("mint should unpack")
+        {
+            MintAccount::SplToken2022(base) => (base.decimals, base.supply, base.mint_authority),
+            MintAccount::SplToken(base) => (base.decimals, base.supply, base.mint_authority),
+        };
+        assert_eq!(decimals, 9);
+        assert_eq!(supply, 1_000);
+        assert_eq!(authority, COption::Some(mint_authority.pubkey()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_mint_preserves_existing_extensions() {
+        use spl_token_2022_interface::extension::{
+            BaseStateWithExtensionsMut, ExtensionType, StateWithExtensionsMut,
+            transfer_fee::TransferFeeConfig,
+        };
+
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let mint = Keypair::new();
+
+        let mint_len = ExtensionType::try_calculate_account_len::<
+            spl_token_2022_interface::state::Mint,
+        >(&[ExtensionType::TransferFeeConfig])
+        .unwrap();
+        let mut data = vec![0u8; mint_len];
+        let mut state =
+            StateWithExtensionsMut::<spl_token_2022_interface::state::Mint>::unpack_uninitialized(
+                &mut data,
+            )
+            .expect("mint buffer should initialize");
+        state.base = spl_token_2022_interface::state::Mint {
+            decimals: 2,
+            is_initialized: true,
+            ..Default::default()
+        };
+        state.pack_base();
+        state.init_account_type().unwrap();
+        state.init_extension::<TransferFeeConfig>(false).unwrap();
+
+        set_account(
+            &client,
+            &mint.pubkey(),
+            &Account {
+                lamports: 1_000_000,
+                data,
+                owner: spl_token_2022_interface::id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+
+        client
+            .rpc
+            .set_mint(
+                Some(client.context.clone()),
+                mint.pubkey().to_string(),
+                MintUpdate {
+                    decimals: Some(4),
+                    ..Default::default()
+                },
+                Some(spl_token_2022_interface::id().to_string()),
+            )
+            .await
+            .expect("set_mint should succeed");
+
+        let account = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader
+                .inner
+                .get_account(&mint.pubkey())
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(account.data.len(), mint_len);
+        assert_eq!(MintAccount::unpack(&account.data).unwrap().decimals(), 4);
+        assert!(
+            mint_has_transfer_fee_config(&account.data),
+            "patching the base must leave the extension tail intact"
+        );
+    }
+
+    fn read_account(client: &TestSetup<SurfnetCheatcodesRpc>, pubkey: &Pubkey) -> Account {
+        client
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.inner.get_account(pubkey).unwrap().unwrap())
+    }
+
+    /// Stores a mint carrying a transfer-fee config under `owner`, funded
+    /// `excess_lamports` above its rent-exempt minimum.
+    fn set_transfer_fee_mint(
+        client: &TestSetup<SurfnetCheatcodesRpc>,
+        mint: &Pubkey,
+        owner: Pubkey,
+        excess_lamports: u64,
+    ) -> Account {
+        use spl_token_2022_interface::extension::{
+            BaseStateWithExtensionsMut, ExtensionType, StateWithExtensionsMut,
+            transfer_fee::TransferFeeConfig,
+        };
+        type Mint2022 = spl_token_2022_interface::state::Mint;
+
+        let mut data = vec![
+            0u8;
+            ExtensionType::try_calculate_account_len::<Mint2022>(&[
+                ExtensionType::TransferFeeConfig
+            ])
+            .unwrap()
+        ];
+        let mut state =
+            StateWithExtensionsMut::<Mint2022>::unpack_uninitialized(&mut data).unwrap();
+        state.base = Mint2022 {
+            decimals: 2,
+            is_initialized: true,
+            ..Default::default()
+        };
+        state.pack_base();
+        state.init_account_type().unwrap();
+        state.init_extension::<TransferFeeConfig>(false).unwrap();
+
+        let lamports = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader
+                .inner
+                .minimum_balance_for_rent_exemption(data.len())
+        }) + excess_lamports;
+        let account = Account {
+            lamports,
+            data,
+            owner,
+            executable: false,
+            rent_epoch: 0,
+        };
+        set_account(client, mint, &account);
+        account
+    }
+
+    async fn call_set_mint(
+        client: &TestSetup<SurfnetCheatcodesRpc>,
+        mint: &Pubkey,
+        update: MintUpdate,
+        token_program: Option<Pubkey>,
+    ) -> Result<RpcResponse<()>> {
+        client
+            .rpc
+            .set_mint(
+                Some(client.context.clone()),
+                mint.to_string(),
+                update,
+                token_program.map(|program| program.to_string()),
+            )
+            .await
+    }
+
+    fn confidential_mint_extension(
+        account: &Account,
+    ) -> spl_token_2022_interface::extension::confidential_transfer::ConfidentialTransferMint {
+        use spl_token_2022_interface::extension::{BaseStateWithExtensions, StateWithExtensions};
+
+        *StateWithExtensions::<spl_token_2022_interface::state::Mint>::unpack(&account.data)
+            .unwrap()
+            .get_extension()
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_mint_confidential_keeps_other_extensions() {
+        use spl_token_2022_interface::extension::{
+            BaseStateWithExtensions, StateWithExtensions,
+            confidential_transfer::ConfidentialTransferMint, transfer_fee::TransferFeeConfig,
+        };
+
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let mint = Pubkey::new_unique();
+        set_transfer_fee_mint(&client, &mint, spl_token_2022_interface::id(), 1_000_000);
+
+        call_set_mint(
+            &client,
+            &mint,
+            MintUpdate {
+                decimals: Some(4),
+                confidential: Some(Default::default()),
+                ..Default::default()
+            },
+            Some(spl_token_2022_interface::id()),
+        )
+        .await
+        .expect("set_mint should succeed");
+
+        let account = read_account(&client, &mint);
+        let state =
+            StateWithExtensions::<spl_token_2022_interface::state::Mint>::unpack(&account.data)
+                .expect("mint should unpack with extensions");
+        assert_eq!(state.base.decimals, 4);
+        assert!(state.get_extension::<TransferFeeConfig>().is_ok());
+        assert!(state.get_extension::<ConfidentialTransferMint>().is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_mint_merges_partial_confidential_update() {
+        use bytemuck::bytes_of;
+        use solana_zk_sdk::encryption::elgamal::ElGamalKeypair;
+        use solana_zk_sdk_pod::encryption::elgamal::PodElGamalPubkey;
+        use surfpool_types::types::ConfidentialTransferMintUpdate;
+
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let mint = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let auditor = PodElGamalPubkey::from(ElGamalKeypair::new_rand().pubkey_owned());
+        set_transfer_fee_mint(&client, &mint, spl_token_2022_interface::id(), 1_000_000);
+
+        for confidential in [
+            ConfidentialTransferMintUpdate {
+                authority: Some(Some(authority.to_string())),
+                auditor_elgamal_pubkey: Some(Some(bs58::encode(bytes_of(&auditor)).into_string())),
+                auto_approve_new_accounts: Some(false),
+            },
+            ConfidentialTransferMintUpdate {
+                auto_approve_new_accounts: Some(true),
+                ..Default::default()
+            },
+        ] {
+            call_set_mint(
+                &client,
+                &mint,
+                MintUpdate {
+                    confidential: Some(confidential),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("set_mint should succeed");
+        }
+
+        let ext = confidential_mint_extension(&read_account(&client, &mint));
+        assert_eq!(bytes_of(&ext.authority), authority.as_ref());
+        assert_eq!(bytes_of(&ext.auditor_elgamal_pubkey), bytes_of(&auditor));
+        assert!(bool::from(ext.auto_approve_new_accounts));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_mint_keeps_excess_lamports() {
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let token_2022 = spl_token_2022_interface::id();
+
+        let funded = Pubkey::new_unique();
+        let before = set_transfer_fee_mint(&client, &funded, token_2022, 1_000_000_000);
+        for update in [
+            MintUpdate {
+                decimals: Some(4),
+                ..Default::default()
+            },
+            MintUpdate {
+                confidential: Some(Default::default()),
+                ..Default::default()
+            },
+        ] {
+            call_set_mint(&client, &funded, update, None)
+                .await
+                .expect("set_mint should succeed");
+            assert_eq!(read_account(&client, &funded).lamports, before.lamports);
+        }
+
+        let at_rent = Pubkey::new_unique();
+        let before = set_transfer_fee_mint(&client, &at_rent, token_2022, 0);
+        call_set_mint(
+            &client,
+            &at_rent,
+            MintUpdate {
+                confidential: Some(Default::default()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("set_mint should succeed");
+
+        let after = read_account(&client, &at_rent);
+        assert!(after.data.len() > before.data.len());
+        assert_eq!(
+            after.lamports,
+            client.context.svm_locker.with_svm_reader(|svm_reader| {
+                svm_reader
+                    .inner
+                    .minimum_balance_for_rent_exemption(after.data.len())
+            }),
+            "a grown mint is topped up to its new rent-exempt minimum"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_mint_infers_token_program_from_owner() {
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let mint = Pubkey::new_unique();
+        set_transfer_fee_mint(&client, &mint, spl_token_2022_interface::id(), 0);
+
+        call_set_mint(
+            &client,
+            &mint,
+            MintUpdate {
+                confidential: Some(Default::default()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("an omitted tokenProgram should resolve to the mint's Token-2022 owner");
+
+        let account = read_account(&client, &mint);
+        assert_eq!(account.owner, spl_token_2022_interface::id());
+        confidential_mint_extension(&account);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_mint_refuses_token_program_that_differs_from_owner() {
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let mint = Pubkey::new_unique();
+        let before = set_transfer_fee_mint(&client, &mint, spl_token_2022_interface::id(), 0);
+
+        let error = call_set_mint(
+            &client,
+            &mint,
+            MintUpdate {
+                decimals: Some(4),
+                ..Default::default()
+            },
+            Some(spl_token_interface::id()),
+        )
+        .await
+        .expect_err("a tokenProgram other than the mint's owner should be refused");
+        assert_eq!(error.code, jsonrpc_core::ErrorCode::InvalidParams);
+        assert_eq!(read_account(&client, &mint).data, before.data);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_mint_refuses_unsupported_owner() {
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let mint = Pubkey::new_unique();
+        let before = set_transfer_fee_mint(&client, &mint, Pubkey::new_unique(), 0);
+
+        let error = call_set_mint(
+            &client,
+            &mint,
+            MintUpdate {
+                decimals: Some(4),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("a mint owned by neither token program should be refused");
+        assert_eq!(error.code, jsonrpc_core::ErrorCode::InvalidParams);
+        assert_eq!(read_account(&client, &mint).data, before.data);
+    }
+
+    /// Sets a confidential mint's authority and auditor, applies `second_update`
+    /// as JSON, and returns the authority, the auditor and the stored extension.
+    async fn confidential_mint_after(
+        second_update: serde_json::Value,
+    ) -> (
+        Pubkey,
+        solana_zk_sdk_pod::encryption::elgamal::PodElGamalPubkey,
+        spl_token_2022_interface::extension::confidential_transfer::ConfidentialTransferMint,
+    ) {
+        use bytemuck::bytes_of;
+        use solana_zk_sdk::encryption::elgamal::ElGamalKeypair;
+        use solana_zk_sdk_pod::encryption::elgamal::PodElGamalPubkey;
+
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let mint = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let auditor = PodElGamalPubkey::from(ElGamalKeypair::new_rand().pubkey_owned());
+        set_transfer_fee_mint(&client, &mint, spl_token_2022_interface::id(), 0);
+
+        for update in [
+            json!({ "confidential": {
+                "authority": authority.to_string(),
+                "auditorElgamalPubkey": bs58::encode(bytes_of(&auditor)).into_string(),
+            } }),
+            second_update,
+        ] {
+            call_set_mint(
+                &client,
+                &mint,
+                serde_json::from_value(update).unwrap(),
+                None,
+            )
+            .await
+            .expect("set_mint should succeed");
+        }
+
+        let ext = confidential_mint_extension(&read_account(&client, &mint));
+        (authority, auditor, ext)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_mint_null_auditor_clears_it() {
+        use bytemuck::bytes_of;
+
+        let (authority, _, ext) =
+            confidential_mint_after(json!({ "confidential": { "auditorElgamalPubkey": null } }))
+                .await;
+        assert_eq!(bytes_of(&ext.auditor_elgamal_pubkey), [0u8; 32]);
+        assert_eq!(
+            bytes_of(&ext.authority),
+            authority.as_ref(),
+            "omitted keeps it"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_mint_null_authority_clears_it() {
+        use bytemuck::bytes_of;
+
+        let (_, auditor, ext) =
+            confidential_mint_after(json!({ "confidential": { "authority": null } })).await;
+        assert_eq!(bytes_of(&ext.authority), [0u8; 32]);
+        assert_eq!(
+            bytes_of(&ext.auditor_elgamal_pubkey),
+            bytes_of(&auditor),
+            "omitted keeps it"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_confidential_mint_feeds_set_token_account() {
+        use bytemuck::bytes_of;
+        use solana_zk_sdk::encryption::elgamal::ElGamalKeypair;
+        use solana_zk_sdk_pod::encryption::elgamal::PodElGamalPubkey;
+        use surfpool_types::types::{
+            ConfidentialTransferAccountUpdate, ConfidentialTransferMintUpdate,
+        };
+
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let owner = Keypair::new();
+        let mint = Keypair::new();
+        let token_program = spl_token_2022_interface::id();
+        let auditor = PodElGamalPubkey::from(ElGamalKeypair::new_rand().pubkey_owned());
+
+        client
+            .rpc
+            .set_mint(
+                Some(client.context.clone()),
+                mint.pubkey().to_string(),
+                MintUpdate {
+                    decimals: Some(6),
+                    confidential: Some(ConfidentialTransferMintUpdate {
+                        auditor_elgamal_pubkey: Some(Some(
+                            bs58::encode(bytes_of(&auditor)).into_string(),
+                        )),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                Some(token_program.to_string()),
+            )
+            .await
+            .expect("set_mint should succeed");
+
+        let token_account = get_associated_token_address_with_program_id(
+            &owner.pubkey(),
+            &mint.pubkey(),
+            &token_program,
+        );
+        let keys = client
+            .rpc
+            .derive_confidential_keys(
+                Some(client.context.clone()),
+                confidential_key_signature(&owner, &token_account),
+            )
+            .expect("key derivation should succeed")
+            .value;
+
+        client
+            .rpc
+            .set_token_account(
+                Some(client.context.clone()),
+                owner.pubkey().to_string(),
+                mint.pubkey().to_string(),
+                TokenAccountUpdate {
+                    confidential: Some(ConfidentialTransferAccountUpdate {
+                        elgamal_pubkey: keys.elgamal_pubkey.clone(),
+                        aes_key: Some(keys.aes_key.clone()),
+                        amount: Some(4_200),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                Some(token_program.to_string()),
+            )
+            .await
+            .expect("set_token_account should succeed");
+
+        let balance = client
+            .rpc
+            .get_confidential_balance(
+                Some(client.context.clone()),
+                token_account.to_string(),
+                ConfidentialBalanceKeys {
+                    aes_key: Some(keys.aes_key),
+                    elgamal_secret_key: Some(keys.elgamal_secret_key),
+                },
+            )
+            .await
+            .expect("get_confidential_balance should succeed")
+            .value;
+
+        assert_eq!(balance.available, Some(4_200));
+    }
+
+    /// `ApproveAccount` reads the mint's `ConfidentialTransferMint` authority, so
+    /// Token-2022 itself accepts the extension `surfnet_setMint` writes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_confidential_mint_accepts_approve_account_instruction() {
+        use spl_token_2022_interface::extension::confidential_transfer::instruction::approve_account;
+        use surfpool_types::{
+            TransactionStatusEvent,
+            types::{ConfidentialTransferAccountUpdate, ConfidentialTransferMintUpdate},
+        };
+
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let owner = Keypair::new();
+        let token_program = spl_token_2022_interface::id();
+        client
+            .context
+            .svm_locker
+            .airdrop(&owner.pubkey(), 1_000_000_000)
+            .unwrap()
+            .unwrap();
+
+        for confidential in [
+            Some(ConfidentialTransferMintUpdate {
+                authority: Some(Some(owner.pubkey().to_string())),
+                ..Default::default()
+            }),
+            None,
+        ] {
+            let has_extension = confidential.is_some();
+            let mint = Keypair::new();
+            client
+                .rpc
+                .set_mint(
+                    Some(client.context.clone()),
+                    mint.pubkey().to_string(),
+                    MintUpdate {
+                        confidential,
+                        ..Default::default()
+                    },
+                    Some(token_program.to_string()),
+                )
+                .await
+                .expect("set_mint should succeed");
+
+            let token_account = get_associated_token_address_with_program_id(
+                &owner.pubkey(),
+                &mint.pubkey(),
+                &token_program,
+            );
+            let keys = client
+                .rpc
+                .derive_confidential_keys(
+                    Some(client.context.clone()),
+                    confidential_key_signature(&owner, &token_account),
+                )
+                .expect("key derivation should succeed")
+                .value;
+            client
+                .rpc
+                .set_token_account(
+                    Some(client.context.clone()),
+                    owner.pubkey().to_string(),
+                    mint.pubkey().to_string(),
+                    TokenAccountUpdate {
+                        confidential: Some(ConfidentialTransferAccountUpdate {
+                            elgamal_pubkey: keys.elgamal_pubkey,
+                            aes_key: Some(keys.aes_key),
+                            approved: Some(false),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    Some(token_program.to_string()),
+                )
+                .await
+                .expect("set_token_account should succeed");
+
+            let recent_blockhash = client
+                .context
+                .svm_locker
+                .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+            let transaction = Transaction::new_signed_with_payer(
+                &[approve_account(
+                    &token_program,
+                    &token_account,
+                    &mint.pubkey(),
+                    &owner.pubkey(),
+                    &[],
+                )
+                .unwrap()],
+                Some(&owner.pubkey()),
+                &[&owner],
+                recent_blockhash,
+            );
+            let (status_tx, status_rx) = crossbeam_channel::unbounded();
+            let _ = client
+                .context
+                .svm_locker
+                .process_transaction(&None, transaction.into(), status_tx, false, true)
+                .await;
+            let status = status_rx.try_recv();
+            assert_eq!(
+                matches!(status, Ok(TransactionStatusEvent::Success(_))),
+                has_extension,
+                "ApproveAccount with the extension {}: got {status:?}",
+                if has_extension { "present" } else { "absent" }
+            );
+        }
     }
 
     /// The pending balance is split across two ciphertexts to keep each within the

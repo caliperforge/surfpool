@@ -2003,7 +2003,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
 
             let SvmAccessContext {
                 slot,
-                inner: fetched_mint,
+                inner: mut mint_account,
                 ..
             } = svm_locker
                 .get_account(
@@ -2025,73 +2025,62 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                 )
                 .await?;
 
-            svm_locker.with_svm_writer(move |svm_writer| -> Result<()> {
-                // The fetch above may await the remote; re-reading under the write lock
-                // keeps a local change that landed meanwhile from being overwritten.
-                let mut mint_account = match svm_writer.inner.get_account_result(&mint)? {
-                    GetAccountResult::None(_) => fetched_mint,
-                    local => local,
+            let token_program_id = mint_account.clone().map_account()?.owner;
+            if token_program_id != spl_token_interface::id()
+                && token_program_id != spl_token_2022_interface::id()
+            {
+                return Err(Error::invalid_params(format!(
+                    "mint {mint} is owned by {token_program_id}, which is neither the SPL Token nor the Token-2022 program"
+                )));
+            }
+            if let Some(requested) =
+                requested_token_program.filter(|requested| *requested != token_program_id)
+            {
+                return Err(Error::invalid_params(format!(
+                    "mint {mint} is owned by {token_program_id}, not the requested token program {requested}"
+                )));
+            }
+            if confidential.is_some() && token_program_id != spl_token_2022_interface::id() {
+                return Err(Error::invalid_params(
+                    "confidential transfer mints require the Token-2022 program (set tokenProgram to the Token-2022 program id)".to_string(),
+                ));
+            }
+
+            let mut mint_data = MintAccount::unpack(mint_account.expected_data())
+                .map_err(|e| Error::invalid_params(format!("Failed to unpack mint data: {}", e)))?;
+
+            update.apply(&mut mint_data)?;
+
+            let final_mint_bytes = if let Some(conf) = &confidential {
+                let base = match &mint_data {
+                    MintAccount::SplToken2022(base) => *base,
+                    MintAccount::SplToken(_) => {
+                        return Err(Error::invalid_params(
+                            "confidential transfer mints require the Token-2022 program"
+                                .to_string(),
+                        ));
+                    }
                 };
+                build_confidential_mint_data(mint_account.expected_data(), &base, conf)
+                    .map_err(Error::invalid_params)?
+            } else {
+                mint_data
+                    .pack_into_preserving_extensions(mint_account.expected_data())
+                    .map_err(|e| Error::invalid_params(format!("Failed to pack mint data: {e}")))?
+            };
 
-                let token_program_id = mint_account.clone().map_account()?.owner;
-                if token_program_id != spl_token_interface::id()
-                    && token_program_id != spl_token_2022_interface::id()
-                {
-                    return Err(Error::invalid_params(format!(
-                        "mint {mint} is owned by {token_program_id}, which is neither the SPL Token nor the Token-2022 program"
-                    )));
-                }
-                if let Some(requested) =
-                    requested_token_program.filter(|requested| *requested != token_program_id)
-                {
-                    return Err(Error::invalid_params(format!(
-                        "mint {mint} is owned by {token_program_id}, not the requested token program {requested}"
-                    )));
-                }
-                if confidential.is_some() && token_program_id != spl_token_2022_interface::id() {
-                    return Err(Error::invalid_params(
-                        "confidential transfer mints require the Token-2022 program (set tokenProgram to the Token-2022 program id)".to_string(),
-                    ));
-                }
-
-                let mut mint_data = MintAccount::unpack(mint_account.expected_data()).map_err(
-                    |e| Error::invalid_params(format!("Failed to unpack mint data: {}", e)),
-                )?;
-
-                update.apply(&mut mint_data)?;
-
-                let final_mint_bytes = if let Some(conf) = &confidential {
-                    let base = match &mint_data {
-                        MintAccount::SplToken2022(base) => *base,
-                        MintAccount::SplToken(_) => {
-                            return Err(Error::invalid_params(
-                                "confidential transfer mints require the Token-2022 program"
-                                    .to_string(),
-                            ));
-                        }
-                    };
-                    build_confidential_mint_data(mint_account.expected_data(), &base, conf)
-                        .map_err(Error::invalid_params)?
-                } else {
-                    mint_data
-                        .pack_into_preserving_extensions(mint_account.expected_data())
-                        .map_err(|e| {
-                            Error::invalid_params(format!("Failed to pack mint data: {e}"))
-                        })?
-                };
-
-                let rent_floor = svm_writer
+            let rent_floor = svm_locker.with_svm_reader(|svm_reader| {
+                svm_reader
                     .inner
-                    .minimum_balance_for_rent_exemption(final_mint_bytes.len());
+                    .minimum_balance_for_rent_exemption(final_mint_bytes.len())
+            });
 
-                mint_account.apply_update(|account| {
-                    account.lamports = account.lamports.max(rent_floor);
-                    account.data = final_mint_bytes.clone();
-                    Ok(())
-                })?;
-                svm_writer.apply_account_update(mint_account, AccountUpdatePolicy::Authoritative)?;
+            mint_account.apply_update(|account| {
+                account.lamports = account.lamports.max(rent_floor);
+                account.data = final_mint_bytes.clone();
                 Ok(())
             })?;
+            svm_locker.apply_account_update(mint_account, AccountUpdatePolicy::Authoritative)?;
 
             Ok(RpcResponse {
                 context: RpcResponseContext::new(slot),

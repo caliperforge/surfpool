@@ -752,7 +752,7 @@
               "description": "The `MintUpdate` struct containing the fields to set on the mint.",
               "schema": {
                 "decimals": "Option<u8>",
-                "mintAuthority": "Option<SetSomeAccount>",
+                "mintAuthority": "Option (base58 public key; omit to keep the current authority, or use the literal string \"null\" to clear it. JSON null does not clear it.)",
                 "supply": "Option<u64>",
                 "confidential": "Option<ConfidentialTransferMintUpdate> (Token-2022 only; writes the confidential-transfer mint extension. Fields: authority (Option<string | null>, base58; null removes it), auditorElgamalPubkey (Option<string | null>, 32 bytes base58/base64; null removes it), autoApproveNewAccounts (Option<bool>, default true). An omitted field keeps its current value.)"
               }

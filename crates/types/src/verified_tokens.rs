@@ -11,47 +11,17 @@ pub struct TokenInfo {
     pub logo_uri: Option<String>,
 }
 
-/// Normalize a CSV field after `parse_csv_line` has already handled quoting.
-fn parse_csv_field(field: &str) -> String {
-    field.trim().to_string()
+fn parse_tsv_line(line: &str) -> Vec<&str> {
+    line.split('\t').map(str::trim).collect()
 }
 
-/// Parse a CSV line into fields, handling quoted strings with commas
-fn parse_csv_line(line: &str) -> Vec<String> {
-    let mut fields = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-    let mut chars = line.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => {
-                if in_quotes && chars.peek() == Some(&'"') {
-                    // Escaped quote
-                    current.push('"');
-                    chars.next();
-                } else {
-                    in_quotes = !in_quotes;
-                }
-            }
-            ',' if !in_quotes => {
-                fields.push(parse_csv_field(&current));
-                current.clear();
-            }
-            _ => current.push(c),
-        }
-    }
-    fields.push(parse_csv_field(&current));
-    fields
-}
-
-/// Every catalog row in CSV order. Option lists must use this: the by-symbol
+/// Every catalog row in TSV order. Option lists must use this: the by-symbol
 /// map collapses tokens sharing a symbol and silently drops their mints.
 pub static VERIFIED_TOKENS: Lazy<Vec<TokenInfo>> = Lazy::new(|| {
-    let csv = include_str!("verified_tokens.csv");
+    let tsv = include_str!("verified_tokens.tsv");
     let mut tokens = Vec::new();
 
-    for (i, line) in csv.lines().enumerate() {
+    for (i, line) in tsv.lines().enumerate() {
         if i == 0 {
             continue; // Skip header
         }
@@ -59,16 +29,15 @@ pub static VERIFIED_TOKENS: Lazy<Vec<TokenInfo>> = Lazy::new(|| {
             continue;
         }
 
-        let fields = parse_csv_line(line);
+        let fields = parse_tsv_line(line);
         if fields.len() < 5 {
             continue; // Skip malformed lines
         }
 
-        // CSV columns: id,name,symbol,icon,decimals,...
-        let address = fields[0].clone();
-        let name = fields[1].clone();
-        let symbol = fields[2].clone();
-        let icon = fields[3].clone();
+        let address = fields[0].to_string();
+        let name = fields[1].to_string();
+        let symbol = fields[2].to_string();
+        let icon = fields[3].to_string();
         let decimals: u8 = fields[4].parse().unwrap_or(0);
 
         tokens.push(TokenInfo {
@@ -92,19 +61,42 @@ pub static VERIFIED_TOKENS_BY_SYMBOL: Lazy<HashMap<String, TokenInfo>> = Lazy::n
 
 #[cfg(test)]
 mod tests {
-    use super::parse_csv_line;
+    use super::{VERIFIED_TOKENS, parse_tsv_line};
 
     #[test]
-    fn parse_csv_line_handles_quoted_fields() {
-        let fields = parse_csv_line(r#"address,"Token, Inc.",TKN,,9"#);
+    fn verified_tokens_loads_every_row() {
+        let rows = include_str!("verified_tokens.tsv")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count()
+            - 1;
+        assert_eq!(VERIFIED_TOKENS.len(), rows);
 
-        assert_eq!(fields, ["address", "Token, Inc.", "TKN", "", "9"]);
+        let wbtc = VERIFIED_TOKENS
+            .iter()
+            .find(|token| token.address == "5XZw2LKTyrfvfiskJ78AMpackRjPcyCif1WhUsPDuVqQ")
+            .expect("WBTC should load");
+        assert_eq!(wbtc.symbol, "WBTC");
+        assert_eq!(wbtc.decimals, 8);
+        assert_eq!(
+            wbtc.logo_uri.as_deref(),
+            Some(
+                "https://j73gp4w27ucraqtyzsqa5th4fwldfvqgq576cnceekfactgk4fla.arweave.net/T_Zn8tr9BRBCeMygDsz8LZYy1gaHf-E0RCKKAUzK4VY"
+            )
+        );
     }
 
     #[test]
-    fn parse_csv_line_preserves_literal_edge_quotes() {
-        let fields = parse_csv_line(r#"address,"""quoted""",QT,,6"#);
+    fn verified_tokens_lines_have_fourteen_fields() {
+        for (i, line) in include_str!("verified_tokens.tsv").lines().enumerate() {
+            assert_eq!(parse_tsv_line(line).len(), 14, "line {}", i + 1);
+        }
+    }
 
-        assert_eq!(fields[1], r#""quoted""#);
+    #[test]
+    fn parse_tsv_line_keeps_commas_in_fields() {
+        let fields = parse_tsv_line("address\tToken, Inc.\tTKN\t\t9");
+
+        assert_eq!(fields, ["address", "Token, Inc.", "TKN", "", "9"]);
     }
 }

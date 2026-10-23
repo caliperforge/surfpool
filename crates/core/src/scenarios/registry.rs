@@ -1106,7 +1106,7 @@ templates: []
             .get("token_mint")
             .expect("token_mint constant should exist");
 
-        // Should have many tokens loaded from verified_tokens.csv
+        // Should have many tokens loaded from verified_tokens.tsv
         assert!(
             token_mint_constant.options.len() > 100,
             "Should have many verified tokens loaded, got {}",

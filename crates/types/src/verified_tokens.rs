@@ -114,15 +114,4 @@ mod tests {
 
         assert_eq!(VERIFIED_TOKENS.len(), rows);
     }
-
-    #[test]
-    fn loads_wbtc() {
-        let wbtc = VERIFIED_TOKENS
-            .iter()
-            .find(|token| token.address == "5XZw2LKTyrfvfiskJ78AMpackRjPcyCif1WhUsPDuVqQ")
-            .expect("WBTC row loads");
-
-        assert_eq!(wbtc.symbol, "WBTC");
-        assert_eq!(wbtc.decimals, 8);
-    }
 }

@@ -7,8 +7,8 @@ use solana_pubkey::Pubkey;
 use solana_signer::Signer as _;
 use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
 use surfpool_types::{
-    VERIFIED_TOKENS, VERIFIED_TOKENS_BY_SYMBOL,
     types::{AccountUpdate, TokenAccountUpdate},
+    verified_tokens::{VERIFIED_TOKENS, VERIFIED_TOKENS_BY_SYMBOL},
 };
 
 const SOL_DECIMALS: u32 = 9;
@@ -369,17 +369,18 @@ mod tests {
     use std::{
         io::{Read, Write},
         net::TcpListener,
+        thread::{self, JoinHandle},
     };
 
     use super::*;
 
-    #[tokio::test]
-    async fn portal_wbtc_mint_resolves_its_decimals() {
+    fn canned_rpc() -> (String, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind canned rpc");
-        let addr = listener.local_addr().expect("local addr");
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
-            assert_ne!(stream.read(&mut [0u8; 16 * 1024]).expect("read request"), 0);
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = [0u8; 16 * 1024];
+            assert_ne!(stream.read(&mut request).expect("read request"), 0);
             let body = r#"{"jsonrpc":"2.0","result":null,"id":1}"#;
             write!(
                 stream,
@@ -388,20 +389,40 @@ mod tests {
             )
             .expect("write response");
         });
+        (url, handle)
+    }
 
-        let response = run(
-            format!("http://{addr}"),
-            SeededAccount::new(None),
-            Some("3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh".to_string()),
-            Some(1),
-            None,
-            None,
-        )
-        .await;
+    #[tokio::test]
+    async fn resolves_shared_symbol_by_mint() {
+        for mint in [
+            "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
+            "5XZw2LKTyrfvfiskJ78AMpackRjPcyCif1WhUsPDuVqQ",
+        ] {
+            let (url, server) = canned_rpc();
+            let response = run(
+                url,
+                SeededAccount::new(None),
+                Some(mint.to_string()),
+                Some(1),
+                None,
+                None,
+            )
+            .await;
+            server.join().expect("canned rpc thread");
 
-        let Some([SetAccountSuccess::Token(updated)]) = response.success.as_deref() else {
-            panic!("{:?}", response.error);
-        };
-        assert_eq!(updated.token_amount, 100_000_000);
+            let success = response
+                .success
+                .unwrap_or_else(|| panic!("{mint}: {:?}", response.error));
+            assert!(
+                matches!(
+                    success.as_slice(),
+                    [SetAccountSuccess::Token(AccountUpdated {
+                        token_amount: 100_000_000,
+                        ..
+                    })]
+                ),
+                "{mint}: {success:?}"
+            );
+        }
     }
 }

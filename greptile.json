@@ -1,0 +1,8 @@
+{
+  "autoReview": [],
+  "strictness": 1,
+  "customContext": {
+    "rules": [],
+    "files": []
+  }
+}

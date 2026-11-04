@@ -57,6 +57,20 @@ pub(crate) fn verify_filters(filters: &[RpcFilterType]) -> Result<()> {
     Ok(())
 }
 
+pub(crate) const MAX_MULTIPLE_ACCOUNTS: usize = 100;
+pub(crate) const MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS: usize = 256;
+pub(crate) const MAX_GET_INFLATION_REWARD_ADDRESSES: usize = 32;
+pub(crate) const MAX_PRIORITIZATION_FEE_ACCOUNTS: usize = 128;
+
+pub(crate) fn verify_input_count(len: usize, max: usize) -> SurfpoolResult<()> {
+    if len > max {
+        return Err(SurfpoolError::invalid_params(format!(
+            "Too many inputs provided; max {max}"
+        )));
+    }
+    Ok(())
+}
+
 fn verify_filter(input: &RpcFilterType) -> Result<()> {
     input
         .verify()
